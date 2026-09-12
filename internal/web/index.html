@@ -208,6 +208,25 @@
   .faint { color: var(--text-faint); }
   .restart-note { color: var(--amber); font-size: 12.5px; margin-top: 8px; display: none; }
   .err-line { color: var(--red); font-size: 12px; font-family: var(--mono); word-break: break-all; }
+
+  /* quota */
+  .quota-bars { display: flex; flex-direction: column; gap: 7px; max-width: 640px; }
+  .qbar { display: grid; grid-template-columns: 104px 1fr 240px; gap: 10px; align-items: center; font-size: 12px; }
+  .qbar .qlabel { color: var(--text-dim); white-space: nowrap; }
+  .qbar .track { background: #0d1117; border: 1px solid var(--border); border-radius: 6px; height: 9px; overflow: hidden; }
+  .qbar .fill { display: block; height: 100%; }
+  .qbar .meta { color: var(--text-faint); font-family: var(--mono); font-size: 11.5px; text-align: right; white-space: nowrap; }
+  .lvl-1 { background: var(--green); }
+  .lvl-2 { background: var(--amber); }
+  .lvl-3 { background: #f97316; }
+  .lvl-4 { background: var(--red); }
+  .quota-meta { display: flex; flex-wrap: wrap; gap: 4px 16px; margin-top: 8px; font-size: 12.5px; color: var(--text-dim); }
+  .quota-meta b { color: var(--text); font-weight: 600; font-family: var(--mono); }
+  .quota-err { color: var(--red); font-size: 12px; font-family: var(--mono); margin-top: 6px; word-break: break-all; }
+
+  /* each account's main row and its quota/usage detail read as one block */
+  tbody.acc-group tr > td { border-bottom: none; }
+  tbody.acc-group + tbody.acc-group tr:first-child > td { border-top: 1px solid var(--border); }
 </style>
 </head>
 <body>
@@ -274,10 +293,13 @@
         <button class="btn primary" id="acc-add-btn">添加</button>
         <button class="btn" id="acc-oauth-btn">通过 OAuth 添加</button>
       </div>
-      <p class="hint">多账号按轮询方式轮流使用；某个账号 429 限流时自动冷却并在期间跳过，401/403/5xx 自动切换到下一个账号。OAuth 需要浏览器能访问服务器的 127.0.0.1:5959-5968 回调端口。</p>
+      <p class="hint">多账号按轮询方式轮流使用；某个账号 429 限流时自动冷却并在期间跳过，401/403/5xx 自动切换到下一个账号。OAuth 需要浏览器能访问服务器的 127.0.0.1:5959-5968 回调端口。额度每 5 分钟自动刷新，也可在账号列表中手动刷新。</p>
     </div>
     <div class="panel">
-      <h3>账号列表</h3>
+      <h3 style="display:flex;align-items:center;justify-content:space-between">
+        <span>账号列表</span>
+        <button class="btn small" id="quota-refresh-all" style="font-weight:400;text-transform:none;letter-spacing:0">刷新全部额度</button>
+      </h3>
       <div id="acc-table"></div>
     </div>
   </section>
@@ -478,6 +500,126 @@ function inTime(iso) {
   return Math.ceil(diff / 3600) + " 小时后";
 }
 
+/* ---------- quota ---------- */
+
+function fmtCredit(n) {
+  if (n == null || !isFinite(Number(n))) return "—";
+  return Number(n).toLocaleString("en-US", { maximumFractionDigits: 2 });
+}
+
+function fmtDate(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "—";
+  return d.toLocaleString();
+}
+
+// Color grading per the reference dashboard: >=50% amber, >=75% heavier
+// amber, >=90% red, otherwise green.
+function quotaLevel(ratio) {
+  if (!isFinite(ratio) || ratio < 0.5) return 1;
+  if (ratio < 0.75) return 2;
+  if (ratio < 0.9) return 3;
+  return 4;
+}
+
+// Relative reset countdown with days, mirroring the reference dashboard.
+// The upstream returns resetAt=0 for an unused window (no reset point), which
+// is shown separately from a known-but-unparseable reset time.
+function fmtDuration(sec) {
+  sec = Math.max(0, Math.floor(sec));
+  const d = Math.floor(sec / 86400); sec %= 86400;
+  const h = Math.floor(sec / 3600); sec %= 3600;
+  const m = Math.floor(sec / 60);
+  if (d > 0) return d + "天" + h + "小时";
+  if (h > 0) return h + "小时" + m + "分钟";
+  return m + "分钟";
+}
+
+function quotaResetText(w) {
+  if (!w.reset_at) {
+    return Number(w.used || 0) > 0 ? "重置时间未知" : "暂未使用，无重置点";
+  }
+  const at = new Date(w.reset_at).getTime();
+  if (!isFinite(at)) return "重置时间未知";
+  return "重置于 " + fmtDuration((at - Date.now()) / 1000) + " 后";
+}
+
+function quotaBar(label, w, estimated) {
+  if (!w) return "";
+  const cap = Number(w.cap || 0), used = Number(w.used || 0);
+  const ratio = cap > 0 ? used / cap : 0;
+  const pct = cap > 0 ? Math.min(100, Math.max(0, ratio * 100)) : 0;
+  let meta = "—";
+  if (cap > 0) {
+    meta = fmtCredit(used) + "$ / " + fmtCredit(cap) + "$";
+    meta += " · " + quotaResetText(w);
+  }
+  return `<div class="qbar">
+    <span class="qlabel">${esc(label)}${estimated ? ' <span class="faint">(按套餐估算)</span>' : ""}</span>
+    <span class="track"><span class="fill lvl-${quotaLevel(ratio)}" style="width:${pct.toFixed(1)}%"></span></span>
+    <span class="meta">${esc(meta)}</span>
+  </div>`;
+}
+
+// The API exposes no monthly window: cap comes from the plan mapping and
+// used = cap − remaining monthly credits. Hidden for unknown plans.
+function quotaMonthBar(q) {
+  const plan = q.plan || {};
+  const cap = plan.monthly_credits;
+  const remaining = q.monthly_credits;
+  if (cap == null || remaining == null || cap <= 0) return "";
+  const used = Math.max(0, cap - remaining);
+  return quotaBar("月度", { used, cap, exceeded: used >= cap, reset_at: plan.current_period_end }, true);
+}
+
+function quotaDetail(a) {
+  const q = a.quota;
+  if (!q) {
+    return `<div class="faint">额度未同步 —— 等待后台刷新或点击“刷新额度”</div>`;
+  }
+  const bars = [
+    quotaBar("5 小时", q.five_hour, false),
+    quotaBar("本周", q.weekly, false),
+    quotaMonthBar(q),
+  ].filter(Boolean).join("");
+  const meta = [];
+  if (q.monthly_credits != null) meta.push(`月度剩余 <b>${esc(fmtCredit(q.monthly_credits))}</b> $`);
+  if (q.purchased_credits != null) meta.push(`充值余额 <b>${esc(fmtCredit(q.purchased_credits))}</b> $`);
+  if (q.free_credits != null) meta.push(`免费余额 <b>${esc(fmtCredit(q.free_credits))}</b> $`);
+  if (q.plan && q.plan.name) meta.push(`套餐 <b>${esc(q.plan.name)}</b>${q.plan.status ? " · " + esc(q.plan.status) : ""}`);
+  if (q.plan && q.plan.current_period_end) meta.push(`账期至 <b>${esc(fmtDate(q.plan.current_period_end))}</b>`);
+  if (q.plan && q.plan.cancel_at_period_end) meta.push(`<span class="badge warn">到期取消</span>`);
+  if (q.below_threshold) meta.push(`<span class="badge warn">低余额</span>`);
+  if (q.exceeded) meta.push(`<span class="badge err">${esc(q.exceeded)} 超限</span>`);
+  const errs = [];
+  if (q.last_error) errs.push(q.last_error);
+  if (q.failures && q.failures.length) errs.push(q.failures.join("；"));
+  const metaHTML = meta.map(m => `<span>${m}</span>`).join("") +
+    (q.last_checked ? `<span class="faint">额度查询 ${esc(relTime(q.last_checked))}</span>` : "");
+  return `<div class="quota-bars">${bars || '<span class="faint">该账号未返回窗口额度</span>'}</div>
+    ${metaHTML ? `<div class="quota-meta">${metaHTML}</div>` : ""}
+    ${errs.length ? `<div class="quota-err">额度查询错误：${esc(errs.join(" / "))}</div>` : ""}`;
+}
+
+async function refreshAccountQuota(id) {
+  toast("正在刷新额度…");
+  try {
+    await api("/admin/api/accounts/" + id + "/quota/refresh", { method: "POST" });
+    toast("额度已刷新");
+    refreshAll();
+  } catch (e) { toast(e.message, true); }
+}
+
+async function refreshAllQuotas() {
+  toast("正在刷新全部额度…");
+  try {
+    const r = await api("/admin/api/quotas/refresh", { method: "POST" });
+    toast("额度已刷新：" + ((r.accounts && r.accounts.length) || 0) + " 个账号");
+    refreshAll();
+  } catch (e) { toast(e.message, true); }
+}
+
 function toast(msg, isErr) {
   const el = document.createElement("div");
   el.className = "toast" + (isErr ? " err" : "");
@@ -601,12 +743,18 @@ setInterval(() => {
 function renderOverview(ov) {
   $("#ver").textContent = ov.version + " · " + ov.listen;
   const u = ov.usage;
+  const quo = ov.quotas || {};
+  const quotaSub = [];
+  if (quo.exceeded) quotaSub.push(quo.exceeded + " 个超限");
+  if (quo.low_balance) quotaSub.push(quo.low_balance + " 个低余额");
+  if (quo.last_checked_at) quotaSub.push("最近 " + relTime(quo.last_checked_at));
   const cards = [
     ["总请求数", fmtInt(u.total_requests), `运行 ${fmtUptime(ov.uptime_seconds)}`],
     ["Prompt Tokens", fmtTokens(u.prompt_tokens), ""],
     ["Completion Tokens", fmtTokens(u.completion_tokens), ""],
     ["Cache 读取 / 写入", fmtTokens(u.cache_read_tokens) + " / " + fmtTokens(u.cache_write_tokens), ""],
     ["账号", `${ov.accounts.enabled} 启用 / ${ov.accounts.total}`, ov.accounts.rate_limited > 0 ? ov.accounts.rate_limited + " 个限流中" : ""],
+    ["额度同步", `${quo.synced || 0} / ${ov.accounts.total}`, quotaSub.join(" · ")],
     ["客户端密钥", `${ov.keys.enabled} 启用 / ${ov.keys.total}`, ""],
     ["模型", `${ov.models.available} 可用`, `共加载 ${ov.models.loaded}`],
   ];
@@ -622,6 +770,9 @@ function renderOverview(ov) {
     <span class="k">监听地址</span><span class="v">${esc(ov.listen)}</span>
     <span class="k">WebUI</span><span class="v">${ov.webui ? "启用" : "禁用"}</span>
     <span class="k">账号限流中</span><span class="v">${accs.rate_limited}</span>
+    <span class="k">额度超限账号</span><span class="v">${quo.exceeded || 0}</span>
+    <span class="k">低余额账号</span><span class="v">${quo.low_balance || 0}</span>
+    <span class="k">最近额度刷新</span><span class="v">${esc(relTime(quo.last_checked_at))}</span>
   </div>`;
   $("#ov-accounts").innerHTML = html;
 }
@@ -658,10 +809,10 @@ function renderAccounts(accounts) {
       <th>最近使用</th>
       <th style="text-align:right">操作</th>
     </tr></thead>
-    <tbody>
     ${accounts.map(a => {
       const tokens = (a.prompt_tokens || 0) + (a.completion_tokens || 0);
-      return `<tr>
+      return `<tbody class="acc-group">
+      <tr class="acc-main">
         <td><strong>${esc(a.name)}</strong></td>
         <td class="mono">${esc(a.key_masked)}</td>
         <td>${statusBadge(a)}${a.auth_failures > 0 && a.status === "ok" ? ` <span class="faint">(${a.auth_failures} 次鉴权失败)</span>` : ""}</td>
@@ -670,15 +821,16 @@ function renderAccounts(accounts) {
         <td class="num" style="text-align:right">${a.errors ? `<span style="color:var(--red)">${a.errors}</span>` : "0"}</td>
         <td class="nowrap dim">${esc(relTime(a.last_used_at))}</td>
         <td><div class="row-actions">
+          <button class="btn small" onclick="refreshAccountQuota('${a.id}')">刷新额度</button>
           <button class="btn small" onclick="testAccount('${a.id}')">测试</button>
           <button class="btn small" onclick="openAccountEdit('${a.id}', '${esc(a.name)}')">编辑</button>
           <button class="btn small" onclick="toggleAccount('${a.id}', ${a.enabled ? "false" : "true"})">${a.enabled ? "禁用" : "启用"}</button>
           <button class="btn small danger" onclick="deleteAccount('${a.id}', '${esc(a.name)}')">删除</button>
         </div></td>
       </tr>
-      ${a.last_error ? `<tr><td colspan="8" class="err-line">最近错误（${esc(relTime(a.last_error_at))}）：${esc(a.last_error)}</td></tr>` : ""}
-    `;}).join("")}
-    </tbody>
+      <tr class="acc-quota"><td colspan="8" style="padding-top:10px;padding-bottom:5px">${quotaDetail(a)}</td></tr>
+      ${a.last_error ? `<tr class="acc-err"><td colspan="8" class="err-line">最近错误（${esc(relTime(a.last_error_at))}）：${esc(a.last_error)}</td></tr>` : ""}
+    </tbody>`;}).join("")}
   </table>`;
 }
 
@@ -1038,6 +1190,7 @@ document.querySelectorAll("nav.tabs button").forEach(b =>
 $("#acc-add-btn").addEventListener("click", addAccount);
 $("#acc-key").addEventListener("keydown", e => { if (e.key === "Enter") addAccount(); });
 $("#acc-oauth-btn").addEventListener("click", openOAuthModal);
+$("#quota-refresh-all").addEventListener("click", refreshAllQuotas);
 $("#oauth-begin").addEventListener("click", startOAuth);
 $("#oauth-cancel").addEventListener("click", () => hideModal("#oauth-modal"));
 $("#oauth-cancel2").addEventListener("click", () => {
