@@ -280,6 +280,13 @@ http://localhost:11434/v1
 https://example.com/ai/v1
 ```
 
+如果 nginx 与 cmdcode2api 在同一台主机，请继续转发 Cloudflare 的
+`CF-Connecting-IP` 和 `X-Forwarded-For`。服务端只接受来自本机回环代理连接的
+这些请求头，并将解析后的地址用于 HTTP 日志和管理登录限流；直连请求即使携带
+伪造请求头，也仍使用 TCP 对端地址。若还需要让 nginx 自身的 `$remote_addr`
+表示最终用户，请在 nginx 中配置 `real_ip_header CF-Connecting-IP`，并填写
+Cloudflare 官方公布的代理网段。
+
 客户端 Bearer Token 使用 `config.yaml` 里 `api_keys` 列表中的任意一把密钥。
 
 ## 模型 ID
@@ -333,4 +340,3 @@ usage.json
 .oauth_state
 .oauth_url
 ```
-

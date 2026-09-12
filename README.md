@@ -241,6 +241,14 @@ Set the base URL to your local gateway:
 http://localhost:11434/v1
 ```
 
+If nginx and cmdcode2api run on the same host, keep forwarding Cloudflare's
+`CF-Connecting-IP` and `X-Forwarded-For` headers. The server accepts these
+headers only from loopback proxy connections, then uses the resolved address
+for HTTP logs and admin login rate limiting. Direct connections with forged
+proxy headers continue to use their TCP peer address. If nginx itself also
+needs `$remote_addr` to represent the end user, configure
+`real_ip_header CF-Connecting-IP` and Cloudflare's published proxy CIDRs.
+
 Use any key from the `api_keys` list in `config.yaml` as the bearer token.
 
 ### curl example

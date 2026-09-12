@@ -91,7 +91,7 @@ func adminAuth(cfg *Config, limiter *ipRateLimiter) func(http.Handler) http.Hand
 	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			ip := clientIP(r.RemoteAddr)
+			ip := requestClientIP(r)
 			if ok, retryAfter := limiter.Allow(ip); !ok {
 				seconds := int(retryAfter.Seconds()) + 1
 				w.Header().Set("Retry-After", strconv.Itoa(seconds))
@@ -158,7 +158,7 @@ func loggingMiddleware(next http.Handler) http.Handler {
 		recorder, wrapped := newStatusRecorder(w)
 		next.ServeHTTP(wrapped, r)
 		if r.URL.Path != "/health" {
-			log.Print(formatHTTPLog(r.Method, r.URL.Path, recorder.status, time.Since(start), r.RemoteAddr))
+			log.Print(formatHTTPLog(r.Method, r.URL.Path, recorder.status, time.Since(start), requestClientIP(r)))
 		}
 	})
 }
