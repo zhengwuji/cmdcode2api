@@ -165,9 +165,13 @@ func (u *UsageTracker) ensureMapsLocked() {
 	}
 }
 
-func (u *UsageTracker) countersFor(m map[string]*UsageCounters, id string) UsageSnapshotEntry {
+// countersFor returns the counters for id from the map selected by m. m is a
+// pointer so the field is dereferenced only under accMu: reading u.accounts /
+// u.clientKeys at the call site would race with ensureMapsLocked, which can
+// initialize them from a background goroutine.
+func (u *UsageTracker) countersFor(m *map[string]*UsageCounters, id string) UsageSnapshotEntry {
 	u.accMu.Lock()
-	c := m[id]
+	c := (*m)[id]
 	u.accMu.Unlock()
 	if c == nil {
 		return UsageSnapshotEntry{}
@@ -177,12 +181,12 @@ func (u *UsageTracker) countersFor(m map[string]*UsageCounters, id string) Usage
 
 // AccountUsage returns a snapshot of one account's durable counters.
 func (u *UsageTracker) AccountUsage(id string) UsageSnapshotEntry {
-	return u.countersFor(u.accounts, id)
+	return u.countersFor(&u.accounts, id)
 }
 
 // ClientKeyUsage returns a snapshot of one client key's durable counters.
 func (u *UsageTracker) ClientKeyUsage(id string) UsageSnapshotEntry {
-	return u.countersFor(u.clientKeys, id)
+	return u.countersFor(&u.clientKeys, id)
 }
 
 // DropAccount forgets a removed account's counters and quota snapshot so they
