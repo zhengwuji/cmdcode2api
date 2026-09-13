@@ -393,6 +393,57 @@ func TestRefreshAllRefreshesEveryAccount(t *testing.T) {
 	}
 }
 
+// All worker slots can be busy with a slow refresh; a caller with a done
+// context (an aborted admin request, a shutting-down server) must not queue
+// behind them.
+func TestRefreshAccountCancelledContextDoesNotQuery(t *testing.T) {
+	redirectUsageFile(t)
+	var hits int
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		writeQuotaFixture(w, r)
+	}))
+	defer srv.Close()
+
+	pool := NewAccountPool(nil)
+	acct, err := pool.Add("main", "cc-key", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cc := NewCCClientWithPool(pool, srv.URL)
+	usage := &UsageTracker{}
+	svc := NewQuotaService(cc, pool, usage)
+
+	for i := 0; i < quotaRefreshWorkers; i++ {
+		svc.sem <- struct{}{}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if snap := svc.RefreshAccount(ctx, acct); snap != nil {
+		t.Fatalf("cancelled refresh returned %+v, want nil", snap)
+	}
+	mu.Lock()
+	n := hits
+	mu.Unlock()
+	if n != 0 {
+		t.Fatalf("upstream hit %d times on a cancelled context", n)
+	}
+	if usage.Quota(acct.ID) != nil {
+		t.Fatal("cancelled refresh stored a snapshot")
+	}
+
+	for i := 0; i < quotaRefreshWorkers; i++ {
+		<-svc.sem
+	}
+	if snap := svc.RefreshAccount(context.Background(), acct); snap == nil || snap.MonthlyCredits == nil {
+		t.Fatalf("refresh after cancel = %+v", snap)
+	}
+}
+
 // ====== persistence ======
 
 func TestUsageSnapshotPersistsQuotas(t *testing.T) {
@@ -537,6 +588,23 @@ func waitForQuota(t *testing.T, usage *UsageTracker, id string) *QuotaSnapshot {
 	}
 }
 
+// waitForQuotaCredits polls until the cached snapshot reports the expected
+// monthly credits — for waiting out an async refresh that replaces a stale
+// snapshot.
+func waitForQuotaCredits(t *testing.T, usage *UsageTracker, id string, credits float64) *QuotaSnapshot {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if snap := usage.Quota(id); snap != nil && snap.MonthlyCredits != nil && *snap.MonthlyCredits == credits {
+			return snap
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("quota for %s did not reach %v in time: %+v", id, credits, usage.Quota(id))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestAdminAddAccountTriggersQuotaRefresh(t *testing.T) {
 	srv, _, usage, _ := newQuotaAdminTestEnv(t)
 
@@ -600,16 +668,16 @@ func TestAdminQuotaRefreshEndpoints(t *testing.T) {
 		t.Fatalf("unknown account status = %d, want 404", resp.StatusCode)
 	}
 
-	// Refresh all.
+	// Refresh all returns immediately and runs in the background.
 	usage.SetQuota(acct.ID, &QuotaSnapshot{MonthlyCredits: floatPtr(0)})
 	resp, payload = adminRequest(t, srv, "POST", "/admin/api/quotas/refresh", "admin-pass-123", nil)
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("refresh all status = %d: %v", resp.StatusCode, payload)
 	}
-	list := payload["accounts"].([]any)
-	if len(list) != 1 || list[0].(map[string]any)["quota"].(map[string]any)["monthly_credits"] != 12.5 {
+	if payload["started"] != true || payload["accounts"] != float64(1) {
 		t.Fatalf("refresh all payload = %v", payload)
 	}
+	waitForQuotaCredits(t, usage, acct.ID, 12.5)
 
 	// Refresh one via the body id.
 	resp, payload = adminRequest(t, srv, "POST", "/admin/api/quotas/refresh", "admin-pass-123",

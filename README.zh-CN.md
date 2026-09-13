@@ -185,7 +185,7 @@ PATCH  /admin/api/accounts/{id}        {"enabled": true} 或 {"name": "..."}
 DELETE /admin/api/accounts/{id}
 POST   /admin/api/accounts/{id}/test
 POST   /admin/api/accounts/{id}/quota/refresh
-POST   /admin/api/quotas/refresh       {"id": "..."} 可选，省略则刷新全部账号
+POST   /admin/api/quotas/refresh       立即返回并在后台刷新全部账号；带 {"id": "..."} 时同步刷新单个账号
 GET    /admin/api/models
 PUT    /admin/api/models               {"exposed": ["model-id", ...]}
 GET    /admin/api/keys
@@ -309,7 +309,11 @@ https://example.com/ai/v1
 如果 nginx 与 cmdcode2api 在同一台主机，请继续转发 Cloudflare 的
 `CF-Connecting-IP` 和 `X-Forwarded-For`。服务端只接受来自本机回环代理连接的
 这些请求头，并将解析后的地址用于 HTTP 日志和管理登录限流；直连请求即使携带
-伪造请求头，也仍使用 TCP 对端地址。若还需要让 nginx 自身的 `$remote_addr`
+伪造请求头，也仍使用 TCP 对端地址。`X-Forwarded-For` 只取最右侧（由追加代理
+写入）的地址：左侧条目客户端可以任意伪造，伪造者换个 IP 就能绕过登录限流。
+因此请勿让 nginx 用 `proxy_add_x_forwarded_for` 保留客户端自带的该请求头，
+并建议在 nginx 层只放行 Cloudflare 官方公布的代理网段，防止绕过 CF 直连源站
+伪造 `CF-Connecting-IP`。若还需要让 nginx 自身的 `$remote_addr`
 表示最终用户，请在 nginx 中配置 `real_ip_header CF-Connecting-IP`，并填写
 Cloudflare 官方公布的代理网段。
 

@@ -522,13 +522,19 @@ func NewQuotaService(cc *CCClient, pool *AccountPool, usage *UsageTracker) *Quot
 
 // RefreshAccount queries the upstream for one account and updates the cached
 // snapshot. A failed query keeps the previous snapshot and only records the
-// error and check time.
+// error and check time. Returns nil without querying when ctx is done —
+// all worker slots can be busy with a slow refresh, and the caller's request
+// must not queue behind them.
 func (s *QuotaService) RefreshAccount(ctx context.Context, acct *Account) *QuotaSnapshot {
 	if acct == nil {
 		return nil
 	}
-	s.sem <- struct{}{}
-	defer func() { <-s.sem }()
+	select {
+	case s.sem <- struct{}{}:
+		defer func() { <-s.sem }()
+	case <-ctx.Done():
+		return nil
+	}
 
 	snap, err := fetchQuotaSnapshot(ctx, s.client, s.cc.BaseURLValue(), acct.APIKey)
 	now := time.Now()
@@ -584,6 +590,18 @@ func (s *QuotaService) RefreshAll(ctx context.Context) int {
 		}(acct)
 	}
 	wg.Wait()
+	return len(accounts)
+}
+
+// RefreshAllAsync queues a background refresh for every account and returns
+// how many were queued. The admin refresh-all endpoint uses it so the HTTP
+// request never blocks on the upstreams; the WebUI picks the snapshots up on
+// its next poll.
+func (s *QuotaService) RefreshAllAsync() int {
+	accounts := s.pool.List()
+	for _, acct := range accounts {
+		s.RefreshAsync(acct)
+	}
 	return len(accounts)
 }
 

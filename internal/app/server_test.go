@@ -230,7 +230,8 @@ func TestRequestClientIPFallsBackThroughTrustedHeaders(t *testing.T) {
 		real string
 		want string
 	}{
-		{name: "xff", xff: "198.51.100.7, 203.0.113.9", want: "198.51.100.7"},
+		{name: "xff takes rightmost entry", xff: "198.51.100.7, 203.0.113.9", want: "203.0.113.9"},
+		{name: "xff ignores forged leftmost entries", xff: "6.6.6.6, 6.6.6.7, 203.0.113.9", want: "203.0.113.9"},
 		{name: "real ip", real: "2001:db8::7", want: "2001:db8::7"},
 		{name: "invalid headers", cf: "not-an-ip", xff: "bad, also-bad", real: "bad", want: "127.0.0.1"},
 	}
@@ -257,6 +258,18 @@ func TestRequestClientIPIgnoresHeadersFromDirectPeer(t *testing.T) {
 
 	if got := requestClientIP(req); got != "198.51.100.20" {
 		t.Fatalf("client IP = %q, want 198.51.100.20", got)
+	}
+}
+
+// An appending proxy keeps client-supplied XFF entries on the left, so the
+// rate-limit key must come from the entry the proxy itself appended.
+func TestRequestClientIPRateLimitKeySurvivesForgedXFFChain(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = "127.0.0.1:11434"
+	req.Header.Set("X-Forwarded-For", "1.2.3.4, 5.6.7.8, 198.51.100.77")
+
+	if got := requestClientIP(req); got != "198.51.100.77" {
+		t.Fatalf("client IP = %q, want 198.51.100.77", got)
 	}
 }
 

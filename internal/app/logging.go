@@ -106,6 +106,9 @@ func clientIP(remoteAddr string) string {
 // requestClientIP returns the client address for logging and admin rate
 // limiting. Proxy headers are trusted only when the direct peer is a loopback
 // address, which is the expected nginx-to-app deployment on one host.
+// Within X-Forwarded-For only the rightmost entry is honored; appending
+// proxies preserve client-supplied entries on the left, where they could be
+// forged to rotate the rate-limit key.
 func requestClientIP(r *http.Request) string {
 	remote := clientIP(r.RemoteAddr)
 	peer := net.ParseIP(remote)
@@ -116,7 +119,7 @@ func requestClientIP(r *http.Request) string {
 	if ip := parseHeaderIP(r.Header.Get("CF-Connecting-IP")); ip != "" {
 		return ip
 	}
-	if ip := firstForwardedIP(r.Header.Get("X-Forwarded-For")); ip != "" {
+	if ip := lastForwardedIP(r.Header.Get("X-Forwarded-For")); ip != "" {
 		return ip
 	}
 	if ip := parseHeaderIP(r.Header.Get("X-Real-IP")); ip != "" {
@@ -141,9 +144,15 @@ func parseHeaderIP(value string) string {
 	return ""
 }
 
-func firstForwardedIP(value string) string {
-	for _, part := range strings.Split(value, ",") {
-		if ip := parseHeaderIP(part); ip != "" {
+// lastForwardedIP returns the rightmost address in an X-Forwarded-For list.
+// Appending proxies (nginx proxy_add_x_forwarded_for, Cloudflare) add the
+// address they received from at the end, so the leftmost entries are
+// client-controlled and the rightmost one is the only value the trusted
+// proxy actually observed.
+func lastForwardedIP(value string) string {
+	parts := strings.Split(value, ",")
+	for i := len(parts) - 1; i >= 0; i-- {
+		if ip := parseHeaderIP(parts[i]); ip != "" {
 			return ip
 		}
 	}

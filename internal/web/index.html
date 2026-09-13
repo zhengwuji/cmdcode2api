@@ -612,11 +612,9 @@ async function refreshAccountQuota(id) {
 }
 
 async function refreshAllQuotas() {
-  toast("正在刷新全部额度…");
   try {
     const r = await api("/admin/api/quotas/refresh", { method: "POST" });
-    toast("额度已刷新：" + ((r.accounts && r.accounts.length) || 0) + " 个账号");
-    refreshAll();
+    toast("已开始刷新 " + ((r && r.accounts) || 0) + " 个账号的额度，结果会自动更新");
   } catch (e) { toast(e.message, true); }
 }
 

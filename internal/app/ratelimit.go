@@ -11,14 +11,18 @@ const (
 	adminFailLimit   = 5
 	adminFailWindow  = 10 * time.Minute
 	adminLockoutTime = 15 * time.Minute
+	// adminPruneThreshold bounds the fail map: forged client IPs can rotate
+	// per request, so entries must not accumulate without limit.
+	adminPruneThreshold = 1024
 )
 
 // ipRateLimiter tracks failed attempts per client IP. After adminFailLimit
 // failures inside adminFailWindow, the IP is locked out for
 // adminLockoutTime. A successful authentication clears the record.
 type ipRateLimiter struct {
-	mu    sync.Mutex
-	fails map[string]*failRecord
+	mu        sync.Mutex
+	fails     map[string]*failRecord
+	lastSweep time.Time
 }
 
 type failRecord struct {
@@ -37,11 +41,12 @@ func (l *ipRateLimiter) Allow(ip string) (bool, time.Duration) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	now := time.Now()
+	l.pruneLocked(now)
 	rec, ok := l.fails[ip]
 	if !ok {
 		return true, 0
 	}
-	now := time.Now()
 	if !rec.lockedUntil.IsZero() {
 		if now.Before(rec.lockedUntil) {
 			return false, time.Until(rec.lockedUntil)
@@ -61,8 +66,12 @@ func (l *ipRateLimiter) Fail(ip string) {
 	defer l.mu.Unlock()
 
 	now := time.Now()
+	l.pruneLocked(now)
 	rec, ok := l.fails[ip]
 	if !ok || now.Sub(rec.windowStart) > adminFailWindow {
+		if !ok && len(l.fails) >= adminPruneThreshold {
+			l.evictOldestLocked()
+		}
 		rec = &failRecord{windowStart: now}
 		l.fails[ip] = rec
 	}
@@ -83,4 +92,44 @@ func (l *ipRateLimiter) Len() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return len(l.fails)
+}
+
+// pruneLocked deletes expired records so untouched IPs do not linger forever.
+// It runs at most once per adminFailWindow, or immediately once the map has
+// grown past adminPruneThreshold.
+func (l *ipRateLimiter) pruneLocked(now time.Time) {
+	if len(l.fails) == 0 {
+		return
+	}
+	if now.Sub(l.lastSweep) < adminFailWindow && len(l.fails) < adminPruneThreshold {
+		return
+	}
+	l.lastSweep = now
+	for ip, rec := range l.fails {
+		if l.expiredLocked(rec, now) {
+			delete(l.fails, ip)
+		}
+	}
+}
+
+func (l *ipRateLimiter) expiredLocked(rec *failRecord, now time.Time) bool {
+	if !rec.lockedUntil.IsZero() {
+		return now.After(rec.lockedUntil)
+	}
+	return now.Sub(rec.windowStart) > adminFailWindow
+}
+
+// evictOldestLocked drops the record with the oldest fail window, keeping the
+// map bounded when pruneLocked cannot keep up with unique forged IPs.
+func (l *ipRateLimiter) evictOldestLocked() {
+	var oldestIP string
+	var oldest time.Time
+	for ip, rec := range l.fails {
+		if oldestIP == "" || rec.windowStart.Before(oldest) {
+			oldestIP, oldest = ip, rec.windowStart
+		}
+	}
+	if oldestIP != "" {
+		delete(l.fails, oldestIP)
+	}
 }

@@ -246,7 +246,13 @@ If nginx and cmdcode2api run on the same host, keep forwarding Cloudflare's
 `CF-Connecting-IP` and `X-Forwarded-For` headers. The server accepts these
 headers only from loopback proxy connections, then uses the resolved address
 for HTTP logs and admin login rate limiting. Direct connections with forged
-proxy headers continue to use their TCP peer address. If nginx itself also
+proxy headers continue to use their TCP peer address. For `X-Forwarded-For`,
+only the rightmost entry (the one an appending proxy wrote) is honored:
+leftmost entries are client-controlled, and a client forging a fresh one per
+request would rotate its rate-limit key. Do not preserve the client-supplied
+header via `proxy_add_x_forwarded_for`, and prefer allowing only Cloudflare's
+published proxy CIDRs at the nginx level so `CF-Connecting-IP` cannot be
+forged by connecting to the origin directly. If nginx itself also
 needs `$remote_addr` to represent the end user, configure
 `real_ip_header CF-Connecting-IP` and Cloudflare's published proxy CIDRs.
 
@@ -400,7 +406,7 @@ PATCH  /admin/api/accounts/{id}        {"enabled": true}, {"name": "..."} or {"a
 DELETE /admin/api/accounts/{id}
 POST   /admin/api/accounts/{id}/test
 POST   /admin/api/accounts/{id}/quota/refresh
-POST   /admin/api/quotas/refresh       {"id": "..."} optional — omit to refresh every account
+POST   /admin/api/quotas/refresh       returns immediately and refreshes every account in the background; with {"id": "..."} it refreshes one account synchronously
 GET    /admin/api/models
 PUT    /admin/api/models               {"exposed": ["model-id", ...]}
 GET    /admin/api/keys

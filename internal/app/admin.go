@@ -287,7 +287,9 @@ func handleAdminAccountQuotaRefresh(pool *AccountPool, usage *UsageTracker, quot
 }
 
 // handleAdminQuotaRefreshAll refreshes every account's quota, or a single one
-// when the body carries an id. It returns the full account list.
+// synchronously when the body carries an id. Refreshing all returns 202
+// immediately and runs in the background — the WebUI polls and picks the
+// snapshots up as they land.
 func handleAdminQuotaRefreshAll(pool *AccountPool, usage *UsageTracker, quotas *QuotaService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if quotas == nil {
@@ -307,10 +309,11 @@ func handleAdminQuotaRefreshAll(pool *AccountPool, usage *UsageTracker, quotas *
 				return
 			}
 			quotas.RefreshAccount(r.Context(), acct)
-		} else {
-			quotas.RefreshAll(r.Context())
+			writeAdminJSON(w, 200, map[string]any{"accounts": adminAccountViews(pool, usage)})
+			return
 		}
-		writeAdminJSON(w, 200, map[string]any{"accounts": adminAccountViews(pool, usage)})
+		queued := quotas.RefreshAllAsync()
+		writeAdminJSON(w, http.StatusAccepted, map[string]any{"started": true, "accounts": queued})
 	}
 }
 
