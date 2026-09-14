@@ -279,11 +279,11 @@ func handleAdminAccountQuotaRefresh(pool *AccountPool, usage *UsageTracker, quot
 	return func(w http.ResponseWriter, r *http.Request) {
 		acct := pool.Get(r.PathValue("id"))
 		if acct == nil {
-			writeAdminError(w, 404, "account not found")
+			writeAdminError(w, r, 404, "account not found")
 			return
 		}
 		if quotas == nil {
-			writeAdminError(w, http.StatusServiceUnavailable, "quota service unavailable")
+			writeAdminError(w, r, http.StatusServiceUnavailable, "quota service unavailable")
 			return
 		}
 		quotas.RefreshAccount(r.Context(), acct)
@@ -298,7 +298,7 @@ func handleAdminAccountQuotaRefresh(pool *AccountPool, usage *UsageTracker, quot
 func handleAdminQuotaRefreshAll(pool *AccountPool, usage *UsageTracker, quotas *QuotaService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if quotas == nil {
-			writeAdminError(w, http.StatusServiceUnavailable, "quota service unavailable")
+			writeAdminError(w, r, http.StatusServiceUnavailable, "quota service unavailable")
 			return
 		}
 		var body struct {
@@ -310,7 +310,7 @@ func handleAdminQuotaRefreshAll(pool *AccountPool, usage *UsageTracker, quotas *
 		if body.ID != "" {
 			acct := pool.Get(body.ID)
 			if acct == nil {
-				writeAdminError(w, 404, "account not found")
+				writeAdminError(w, r, 404, "account not found")
 				return
 			}
 			quotas.RefreshAccount(r.Context(), acct)
