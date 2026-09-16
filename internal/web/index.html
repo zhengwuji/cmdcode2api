@@ -498,7 +498,7 @@ const I18N = {
     "quota.refreshAll": "Refresh all quotas",
     "quota.refreshOne": "Refresh quota",
     "quota.refreshing": "Refreshing quotas…",
-    "quota.refreshed": "Quotas refreshed: {n} account(s)",
+    "quota.refreshStarted": "Started refreshing {n} account(s) — results update automatically",
     "quota.syncStatus": "Quota sync",
     "quota.syncValue": "{synced} of {total} synced",
     "quota.exceeded": "{n} quota exceeded",
@@ -521,13 +521,9 @@ const I18N = {
     "quota.monthly": "Monthly",
     "quota.weekly": "Weekly",
     "quota.window.5h": "5 hours",
-    "quota.window.weekly": "Weekly",
-    "quota.window.monthly": "Monthly",
     "quota.monthlyRemaining": "Monthly remaining {v}$",
     "quota.purchasedBalance": "Purchased balance {v}$",
     "quota.freeBalance": "Free balance {v}$",
-    "quota.plan": "Plan",
-    "quota.planStatus": "{plan} · {status}",
     "quota.billingPeriod": "Billing period to {v}",
     "quota.cancelAtPeriodEnd": "Cancel at period end",
     "quota.lowBalanceBadge": "low balance",
@@ -535,7 +531,6 @@ const I18N = {
     "quota.estimated": "(estimated)",
     "quota.unknownReset": "Reset time unknown",
     "quota.noResetPoint": "Not used yet, no reset point",
-    "quota.resetIn": "Resets in {d}",
 
     "login.desc": "Sign in to the admin API with admin_password from your config file.",
     "login.serverAddress": "Server address",
@@ -559,9 +554,6 @@ const I18N = {
     "time.inSeconds": "in {n}s",
     "time.inMinutes": "in {n} min",
     "time.inHours": "in {n}h",
-    "time.dayShort": "{n}d",
-    "time.hourShort": "{n}h",
-    "time.minuteShort": "{n}m",
 
     "uptime.dhm": "{d}d {h}h {m}m",
     "uptime.hm": "{h}h {m}m",
@@ -712,7 +704,7 @@ const I18N = {
     "quota.refreshAll": "刷新全部额度",
     "quota.refreshOne": "刷新额度",
     "quota.refreshing": "正在刷新额度…",
-    "quota.refreshed": "额度已刷新：{n} 个账号",
+    "quota.refreshStarted": "已开始刷新 {n} 个账号的额度，结果会自动更新",
     "quota.syncStatus": "额度同步",
     "quota.syncValue": "{synced} / {total} 已同步",
     "quota.exceeded": "{n} 额度超限",
@@ -735,13 +727,9 @@ const I18N = {
     "quota.monthly": "每月",
     "quota.weekly": "每周",
     "quota.window.5h": "5 小时",
-    "quota.window.weekly": "每周",
-    "quota.window.monthly": "每月",
     "quota.monthlyRemaining": "本月剩余 {v}$",
     "quota.purchasedBalance": "已购余额 {v}$",
     "quota.freeBalance": "免费余额 {v}$",
-    "quota.plan": "套餐",
-    "quota.planStatus": "{plan} · {status}",
     "quota.billingPeriod": "账期截至 {v}",
     "quota.cancelAtPeriodEnd": "到期后取消",
     "quota.lowBalanceBadge": "余额不足",
@@ -749,7 +737,6 @@ const I18N = {
     "quota.estimated": "（估计）",
     "quota.unknownReset": "重置时间未知",
     "quota.noResetPoint": "尚未使用，无重置点",
-    "quota.resetIn": "{d} 后重置",
 
     "login.desc": "使用配置文件中的 admin_password 登录管理接口",
     "login.serverAddress": "服务器地址",
@@ -773,9 +760,6 @@ const I18N = {
     "time.inSeconds": "{n} 秒后",
     "time.inMinutes": "{n} 分钟后",
     "time.inHours": "{n} 小时后",
-    "time.dayShort": "{n}天",
-    "time.hourShort": "{n}小时",
-    "time.minuteShort": "{n}分钟",
 
     "uptime.dhm": "{d}天 {h}小时 {m}分",
     "uptime.hm": "{h}小时 {m}分",
@@ -1105,8 +1089,8 @@ function quotaDetail(a) {
   if (q.below_threshold) meta.push('<span class="badge warn">' + esc(t("quota.lowBalanceBadge")) + '</span>');
   if (q.exceeded) meta.push('<span class="badge err">' + esc(t("quota.exceededBadge", { n: q.exceeded })) + '</span>');
   const errs = [];
-  if (q.last_error) errs.push(q.last_error);
-  if (q.failures && q.failures.length) errs.push(q.failures.join(", "));
+  if (q.last_error) errs.push(q.last_error); // backend already localized via Accept-Language
+  if (q.failures && q.failures.length) errs.push(q.failures.join(t("common.listSep")));
   const metaHTML = meta.map(m => `<span>${m}</span>`).join("") +
     (q.last_checked ? `<span class="faint">${esc(t("quota.lastChecked", { when: relTime(q.last_checked) }))}</span>` : "");
   return `<div class="quota-bars">${bars || `<span class="faint">${esc(t("quota.noWindow"))}</span>`}</div>
@@ -1127,8 +1111,8 @@ async function refreshAllQuotas() {
   toast(t("quota.refreshing"));
   try {
     const r = await api("/admin/api/quotas/refresh", { method: "POST" });
-    toast(t("quota.refreshed", { n: (r.accounts && r.accounts.length) || 0 }));
-    refreshAll();
+    // 202 {started, accounts:<n>} — snapshots land via the 5s refreshAll() poll.
+    toast(t("quota.refreshStarted", { n: (r && r.accounts) || 0 }));
   } catch (e) { toast(e.message, true); }
 }
 

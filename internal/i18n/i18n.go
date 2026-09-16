@@ -68,6 +68,9 @@ var translations = map[Lang]map[string]string{
 		"no pending OAuth flow":                           "当前没有进行中的 OAuth 授权",
 		"method not allowed":                              "请求方法不允许",
 		"invalid JSON":                                    "JSON 无效",
+
+		// quota
+		"quota endpoints returned no data": "额度接口返回空数据",
 	},
 }
 
@@ -89,6 +92,8 @@ var wrapped = map[Lang]map[string]string{
 		"authorization canceled: ":                 "授权被取消：",
 		"OAuth timed out after ":                   "OAuth 授权超时：",
 		"decode response: ":                        "解析响应失败：",
+		"API key rejected: ":                       "API Key 被拒绝：",
+		"all quota endpoints failed: ":             "所有额度接口均无法访问：",
 	},
 }
 

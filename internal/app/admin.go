@@ -67,14 +67,35 @@ type adminAccount struct {
 	Quota *QuotaSnapshot `json:"quota,omitempty"`
 }
 
-func adminAccountViews(pool *AccountPool, usage *UsageTracker) []adminAccount {
+// localizeQuotaSnapshot returns a shallow copy of snap with the user-facing
+// error texts (LastError, Failures) translated to the request language. The
+// stored snapshot keeps English sources; only the admin API copy is localized.
+// English returns the snapshot unchanged, matching i18n's EN-is-source design.
+func localizeQuotaSnapshot(lang i18n.Lang, snap *QuotaSnapshot) *QuotaSnapshot {
+	if snap == nil || lang == i18n.EN || (snap.LastError == "" && len(snap.Failures) == 0) {
+		return snap
+	}
+	out := *snap
+	if out.LastError != "" {
+		out.LastError = i18n.Message(lang, out.LastError)
+	}
+	if len(out.Failures) > 0 {
+		out.Failures = make([]string, len(snap.Failures))
+		for i, f := range snap.Failures {
+			out.Failures[i] = i18n.Message(lang, f)
+		}
+	}
+	return &out
+}
+
+func adminAccountViews(pool *AccountPool, usage *UsageTracker, r *http.Request) []adminAccount {
 	views := pool.Views()
 	out := make([]adminAccount, 0, len(views))
 	for _, v := range views {
 		out = append(out, adminAccount{
 			AccountView:        v,
 			UsageSnapshotEntry: usage.AccountUsage(v.ID),
-			Quota:              usage.Quota(v.ID),
+			Quota:              localizeQuotaSnapshot(i18n.FromRequest(r), usage.Quota(v.ID)),
 		})
 	}
 	return out
@@ -169,7 +190,7 @@ func quotaSummary(pool *AccountPool, usage *UsageTracker) adminQuotaSummary {
 
 func handleAdminAccountsList(pool *AccountPool, usage *UsageTracker) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		writeAdminJSON(w, 200, map[string]any{"accounts": adminAccountViews(pool, usage)})
+		writeAdminJSON(w, 200, map[string]any{"accounts": adminAccountViews(pool, usage, r)})
 	}
 }
 
@@ -287,7 +308,7 @@ func handleAdminAccountQuotaRefresh(pool *AccountPool, usage *UsageTracker, quot
 			return
 		}
 		quotas.RefreshAccount(r.Context(), acct)
-		writeAdminJSON(w, 200, adminAccount{AccountView: acct.View(), UsageSnapshotEntry: usage.AccountUsage(acct.ID), Quota: usage.Quota(acct.ID)})
+		writeAdminJSON(w, 200, adminAccount{AccountView: acct.View(), UsageSnapshotEntry: usage.AccountUsage(acct.ID), Quota: localizeQuotaSnapshot(i18n.FromRequest(r), usage.Quota(acct.ID))})
 	}
 }
 
@@ -314,7 +335,7 @@ func handleAdminQuotaRefreshAll(pool *AccountPool, usage *UsageTracker, quotas *
 				return
 			}
 			quotas.RefreshAccount(r.Context(), acct)
-			writeAdminJSON(w, 200, map[string]any{"accounts": adminAccountViews(pool, usage)})
+			writeAdminJSON(w, 200, map[string]any{"accounts": adminAccountViews(pool, usage, r)})
 			return
 		}
 		queued := quotas.RefreshAllAsync()
@@ -797,7 +818,7 @@ func handleAdminOAuthStatus(pool *AccountPool) http.HandlerFunc {
 			}
 		case "failed":
 			if err := flow.Err(); err != nil {
-				resp["error"] = err.Error()
+				resp["error"] = i18n.Message(i18n.FromRequest(r), err.Error())
 			}
 		}
 		writeAdminJSON(w, 200, resp)
