@@ -280,7 +280,7 @@ func TestFetchQuotaSnapshotNonJSONFailsWhenNoData(t *testing.T) {
 	defer srv.Close()
 
 	_, err := fetchQuotaSnapshot(context.Background(), srv.Client(), srv.URL, "cc-key")
-	if err == nil || !strings.Contains(err.Error(), "所有额度接口均无法访问") {
+	if err == nil || !strings.Contains(err.Error(), "all quota endpoints failed") {
 		t.Fatalf("err = %v, want aggregate failure", err)
 	}
 }

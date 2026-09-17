@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"cmdcode2api/internal/i18n"
 )
 
 // newAdminTestEnv starts an admin API server backed by temp-dir persistence.
@@ -398,5 +400,41 @@ func TestConfigFileRedirectedForAdminPersistence(t *testing.T) {
 		map[string]any{"name": "x", "api_key": "cc-k"})
 	if _, err := os.Stat(configFile); err != nil {
 		t.Fatalf("config file not written: %v", err)
+	}
+}
+
+func TestLocalizeQuotaSnapshot(t *testing.T) {
+	snap := &QuotaSnapshot{
+		LastError: "API key rejected: HTTP 401",
+		Failures:  []string{"whoami: context deadline exceeded", "quota endpoints returned no data"},
+	}
+
+	// English (the source of truth) returns the snapshot unchanged.
+	if got := localizeQuotaSnapshot(i18n.EN, snap); got != snap {
+		t.Fatalf("EN should return the same snapshot, got %+v", got)
+	}
+
+	// Chinese translates both fields and leaves the stored snapshot intact.
+	got := localizeQuotaSnapshot(i18n.ZHCN, snap)
+	if got.LastError != "API Key 被拒绝：HTTP 401" {
+		t.Fatalf("LastError = %q", got.LastError)
+	}
+	wantFailures := []string{"whoami: context deadline exceeded", "额度接口返回空数据"}
+	if len(got.Failures) != len(wantFailures) || got.Failures[0] != wantFailures[0] || got.Failures[1] != wantFailures[1] {
+		t.Fatalf("Failures = %v, want %v", got.Failures, wantFailures)
+	}
+	if snap.LastError != "API key rejected: HTTP 401" || len(snap.Failures) != 2 {
+		t.Fatalf("stored snapshot was mutated: %+v", snap)
+	}
+
+	// A snapshot without error texts is passed through untouched.
+	clean := &QuotaSnapshot{MonthlyCredits: floatPtr(1)}
+	if got := localizeQuotaSnapshot(i18n.ZHCN, clean); got != clean {
+		t.Fatalf("clean snapshot should be returned as-is, got %+v", got)
+	}
+
+	// Nil is nil-safe (mirrors usage.Quota returning nil for unknown accounts).
+	if got := localizeQuotaSnapshot(i18n.ZHCN, nil); got != nil {
+		t.Fatalf("nil snapshot = %+v, want nil", got)
 	}
 }

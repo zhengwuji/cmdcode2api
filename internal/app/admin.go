@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"cmdcode2api/internal/i18n"
 )
 
 // registerAdminRoutes wires the admin JSON API used by the WebUI. It must be
@@ -46,8 +48,11 @@ func writeAdminJSON(w http.ResponseWriter, status int, payload any) {
 	json.NewEncoder(w).Encode(payload)
 }
 
-func writeAdminError(w http.ResponseWriter, status int, msg string) {
-	writeAdminJSON(w, status, map[string]any{"error": msg})
+// writeAdminError answers with an error message localized for the caller's
+// Accept-Language. Messages are written in English at the call site; English is
+// also the fallback, so an unsupported language changes nothing.
+func writeAdminError(w http.ResponseWriter, r *http.Request, status int, msg string) {
+	writeAdminJSON(w, status, map[string]any{"error": i18n.Message(i18n.FromRequest(r), msg)})
 }
 
 func subtleConstantTimeEqual(a, b string) bool {
@@ -62,14 +67,35 @@ type adminAccount struct {
 	Quota *QuotaSnapshot `json:"quota,omitempty"`
 }
 
-func adminAccountViews(pool *AccountPool, usage *UsageTracker) []adminAccount {
+// localizeQuotaSnapshot returns a shallow copy of snap with the user-facing
+// error texts (LastError, Failures) translated to the request language. The
+// stored snapshot keeps English sources; only the admin API copy is localized.
+// English returns the snapshot unchanged, matching i18n's EN-is-source design.
+func localizeQuotaSnapshot(lang i18n.Lang, snap *QuotaSnapshot) *QuotaSnapshot {
+	if snap == nil || lang == i18n.EN || (snap.LastError == "" && len(snap.Failures) == 0) {
+		return snap
+	}
+	out := *snap
+	if out.LastError != "" {
+		out.LastError = i18n.Message(lang, out.LastError)
+	}
+	if len(out.Failures) > 0 {
+		out.Failures = make([]string, len(snap.Failures))
+		for i, f := range snap.Failures {
+			out.Failures[i] = i18n.Message(lang, f)
+		}
+	}
+	return &out
+}
+
+func adminAccountViews(pool *AccountPool, usage *UsageTracker, r *http.Request) []adminAccount {
 	views := pool.Views()
 	out := make([]adminAccount, 0, len(views))
 	for _, v := range views {
 		out = append(out, adminAccount{
 			AccountView:        v,
 			UsageSnapshotEntry: usage.AccountUsage(v.ID),
-			Quota:              usage.Quota(v.ID),
+			Quota:              localizeQuotaSnapshot(i18n.FromRequest(r), usage.Quota(v.ID)),
 		})
 	}
 	return out
@@ -164,7 +190,7 @@ func quotaSummary(pool *AccountPool, usage *UsageTracker) adminQuotaSummary {
 
 func handleAdminAccountsList(pool *AccountPool, usage *UsageTracker) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		writeAdminJSON(w, 200, map[string]any{"accounts": adminAccountViews(pool, usage)})
+		writeAdminJSON(w, 200, map[string]any{"accounts": adminAccountViews(pool, usage, r)})
 	}
 }
 
@@ -175,7 +201,7 @@ func handleAdminAccountAdd(pool *AccountPool, cfg *Config, usage *UsageTracker, 
 			APIKey string `json:"api_key"`
 		}
 		if err := decodeJSONBody(w, r, &body); err != nil {
-			writeAdminError(w, 400, err.Error())
+			writeAdminError(w, r, 400, err.Error())
 			return
 		}
 		body.Name = strings.TrimSpace(body.Name)
@@ -184,11 +210,11 @@ func handleAdminAccountAdd(pool *AccountPool, cfg *Config, usage *UsageTracker, 
 		}
 		acct, err := pool.Add(body.Name, body.APIKey, true)
 		if err != nil {
-			writeAdminError(w, http.StatusConflict, err.Error())
+			writeAdminError(w, r, http.StatusConflict, err.Error())
 			return
 		}
 		if err := persistPool(pool, cfg); err != nil {
-			writeAdminError(w, 500, "account added but saving config failed: "+err.Error())
+			writeAdminError(w, r, 500, "account added but saving config failed: "+err.Error())
 			return
 		}
 		// Started without accounts? The model catalog is empty then; fetch it
@@ -213,16 +239,16 @@ func handleAdminAccountPatch(pool *AccountPool, cfg *Config, usage *UsageTracker
 			APIKey  *string `json:"api_key"`
 		}
 		if err := decodeJSONBody(w, r, &body); err != nil {
-			writeAdminError(w, 400, err.Error())
+			writeAdminError(w, r, 400, err.Error())
 			return
 		}
 		if body.Enabled != nil && !pool.SetEnabled(id, *body.Enabled) {
-			writeAdminError(w, 404, "account not found")
+			writeAdminError(w, r, 404, "account not found")
 			return
 		}
 		if body.Name != nil {
 			if !pool.Rename(id, strings.TrimSpace(*body.Name)) {
-				writeAdminError(w, 404, "account not found")
+				writeAdminError(w, r, 404, "account not found")
 				return
 			}
 		}
@@ -230,7 +256,7 @@ func handleAdminAccountPatch(pool *AccountPool, cfg *Config, usage *UsageTracker
 		if body.APIKey != nil {
 			newID, err := pool.SetKey(id, *body.APIKey)
 			if err != nil {
-				writeAdminError(w, http.StatusConflict, err.Error())
+				writeAdminError(w, r, http.StatusConflict, err.Error())
 				return
 			}
 			// The ID derives from the key; carry the usage history over, but
@@ -241,7 +267,7 @@ func handleAdminAccountPatch(pool *AccountPool, cfg *Config, usage *UsageTracker
 			keyChanged = true
 		}
 		if err := persistPool(pool, cfg); err != nil {
-			writeAdminError(w, 500, "saving config failed: "+err.Error())
+			writeAdminError(w, r, 500, "saving config failed: "+err.Error())
 			return
 		}
 		acct := pool.Get(id)
@@ -256,12 +282,12 @@ func handleAdminAccountDelete(pool *AccountPool, cfg *Config, usage *UsageTracke
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
 		if !pool.Remove(id) {
-			writeAdminError(w, 404, "account not found")
+			writeAdminError(w, r, 404, "account not found")
 			return
 		}
 		usage.DropAccount(id)
 		if err := persistPool(pool, cfg); err != nil {
-			writeAdminError(w, 500, "saving config failed: "+err.Error())
+			writeAdminError(w, r, 500, "saving config failed: "+err.Error())
 			return
 		}
 		writeAdminJSON(w, 200, map[string]any{"deleted": true})
@@ -274,15 +300,15 @@ func handleAdminAccountQuotaRefresh(pool *AccountPool, usage *UsageTracker, quot
 	return func(w http.ResponseWriter, r *http.Request) {
 		acct := pool.Get(r.PathValue("id"))
 		if acct == nil {
-			writeAdminError(w, 404, "account not found")
+			writeAdminError(w, r, 404, "account not found")
 			return
 		}
 		if quotas == nil {
-			writeAdminError(w, http.StatusServiceUnavailable, "quota service unavailable")
+			writeAdminError(w, r, http.StatusServiceUnavailable, "quota service unavailable")
 			return
 		}
 		quotas.RefreshAccount(r.Context(), acct)
-		writeAdminJSON(w, 200, adminAccount{AccountView: acct.View(), UsageSnapshotEntry: usage.AccountUsage(acct.ID), Quota: usage.Quota(acct.ID)})
+		writeAdminJSON(w, 200, adminAccount{AccountView: acct.View(), UsageSnapshotEntry: usage.AccountUsage(acct.ID), Quota: localizeQuotaSnapshot(i18n.FromRequest(r), usage.Quota(acct.ID))})
 	}
 }
 
@@ -293,7 +319,7 @@ func handleAdminAccountQuotaRefresh(pool *AccountPool, usage *UsageTracker, quot
 func handleAdminQuotaRefreshAll(pool *AccountPool, usage *UsageTracker, quotas *QuotaService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if quotas == nil {
-			writeAdminError(w, http.StatusServiceUnavailable, "quota service unavailable")
+			writeAdminError(w, r, http.StatusServiceUnavailable, "quota service unavailable")
 			return
 		}
 		var body struct {
@@ -305,11 +331,11 @@ func handleAdminQuotaRefreshAll(pool *AccountPool, usage *UsageTracker, quotas *
 		if body.ID != "" {
 			acct := pool.Get(body.ID)
 			if acct == nil {
-				writeAdminError(w, 404, "account not found")
+				writeAdminError(w, r, 404, "account not found")
 				return
 			}
 			quotas.RefreshAccount(r.Context(), acct)
-			writeAdminJSON(w, 200, map[string]any{"accounts": adminAccountViews(pool, usage)})
+			writeAdminJSON(w, 200, map[string]any{"accounts": adminAccountViews(pool, usage, r)})
 			return
 		}
 		queued := quotas.RefreshAllAsync()
@@ -347,7 +373,7 @@ func handleAdminModelsPut(cfg *Config) http.HandlerFunc {
 			Exposed []string `json:"exposed"`
 		}
 		if err := decodeJSONBody(w, r, &body); err != nil {
-			writeAdminError(w, 400, err.Error())
+			writeAdminError(w, r, 400, err.Error())
 			return
 		}
 		exposed := make(map[string]bool, len(body.Exposed))
@@ -381,7 +407,7 @@ func handleAdminModelsPut(cfg *Config) http.HandlerFunc {
 
 		cfg.SetExcludes(excludes)
 		if err := saveConfig(configFile, cfg); err != nil {
-			writeAdminError(w, 500, "applied but saving config failed: "+err.Error())
+			writeAdminError(w, r, 500, "applied but saving config failed: "+err.Error())
 			return
 		}
 		log.Printf("model exposure updated via webui (%d exposed, %d excluded)", len(exposed), len(excludes))
@@ -421,7 +447,7 @@ func handleAdminKeyAdd(keys *ClientKeyPool, cfg *Config, usage *UsageTracker) ht
 			Name string `json:"name"`
 		}
 		if err := decodeJSONBody(w, r, &body); err != nil {
-			writeAdminError(w, 400, err.Error())
+			writeAdminError(w, r, 400, err.Error())
 			return
 		}
 		body.Name = strings.TrimSpace(body.Name)
@@ -430,11 +456,11 @@ func handleAdminKeyAdd(keys *ClientKeyPool, cfg *Config, usage *UsageTracker) ht
 		}
 		key, err := keys.Add(body.Name, "", true)
 		if err != nil {
-			writeAdminError(w, http.StatusConflict, err.Error())
+			writeAdminError(w, r, http.StatusConflict, err.Error())
 			return
 		}
 		if err := persistKeys(keys, cfg); err != nil {
-			writeAdminError(w, 500, "key created but saving config failed: "+err.Error())
+			writeAdminError(w, r, 500, "key created but saving config failed: "+err.Error())
 			return
 		}
 		log.Printf("client key %q added via webui", key.Name)
@@ -454,7 +480,7 @@ func handleAdminKeyReveal(keys *ClientKeyPool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		key := keys.Get(r.PathValue("id"))
 		if key == nil {
-			writeAdminError(w, 404, "key not found")
+			writeAdminError(w, r, 404, "key not found")
 			return
 		}
 		writeAdminJSON(w, 200, map[string]any{"id": key.ID, "key": key.Key})
@@ -469,21 +495,21 @@ func handleAdminKeyPatch(keys *ClientKeyPool, cfg *Config, usage *UsageTracker) 
 			Name    *string `json:"name"`
 		}
 		if err := decodeJSONBody(w, r, &body); err != nil {
-			writeAdminError(w, 400, err.Error())
+			writeAdminError(w, r, 400, err.Error())
 			return
 		}
 		if body.Enabled != nil && !keys.SetEnabled(id, *body.Enabled) {
-			writeAdminError(w, 404, "key not found")
+			writeAdminError(w, r, 404, "key not found")
 			return
 		}
 		if body.Name != nil {
 			if !keys.Rename(id, strings.TrimSpace(*body.Name)) {
-				writeAdminError(w, 404, "key not found")
+				writeAdminError(w, r, 404, "key not found")
 				return
 			}
 		}
 		if err := persistKeys(keys, cfg); err != nil {
-			writeAdminError(w, 500, "saving config failed: "+err.Error())
+			writeAdminError(w, r, 500, "saving config failed: "+err.Error())
 			return
 		}
 		key := keys.Get(id)
@@ -495,12 +521,12 @@ func handleAdminKeyDelete(keys *ClientKeyPool, cfg *Config, usage *UsageTracker)
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
 		if !keys.Remove(id) {
-			writeAdminError(w, 404, "key not found")
+			writeAdminError(w, r, 404, "key not found")
 			return
 		}
 		usage.DropClientKey(id)
 		if err := persistKeys(keys, cfg); err != nil {
-			writeAdminError(w, 500, "saving config failed: "+err.Error())
+			writeAdminError(w, r, 500, "saving config failed: "+err.Error())
 			return
 		}
 		writeAdminJSON(w, 200, map[string]any{"deleted": true})
@@ -513,7 +539,7 @@ func handleAdminAccountTest(pool *AccountPool, cc *CCClient) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		acct := pool.Get(r.PathValue("id"))
 		if acct == nil {
-			writeAdminError(w, 404, "account not found")
+			writeAdminError(w, r, 404, "account not found")
 			return
 		}
 		result := testAccountKey(cc.BaseURLValue(), acct.APIKey)
@@ -606,17 +632,17 @@ func handleAdminSettingsPut(cfg *Config, cc *CCClient, pool *AccountPool) http.H
 	return func(w http.ResponseWriter, r *http.Request) {
 		var body adminSettingsUpdate
 		if err := decodeJSONBody(w, r, &body); err != nil {
-			writeAdminError(w, 400, err.Error())
+			writeAdminError(w, r, 400, err.Error())
 			return
 		}
 		// 修改管理密码必须提供原密码；错误即拒绝，不泄露当前值。
 		if body.AdminPassword != nil && len(strings.TrimSpace(*body.AdminPassword)) < 8 {
-			writeAdminError(w, 400, "admin_password must be at least 8 characters")
+			writeAdminError(w, r, 400, "admin_password must be at least 8 characters")
 			return
 		}
 		if body.AdminPassword != nil {
 			if body.OldPassword == nil || !subtleConstantTimeEqual(*body.OldPassword, cfg.adminPassword()) {
-				writeAdminError(w, http.StatusForbidden, "当前管理密码不正确")
+				writeAdminError(w, r, http.StatusForbidden, "current admin password is incorrect")
 				return
 			}
 		}
@@ -629,7 +655,7 @@ func handleAdminSettingsPut(cfg *Config, cc *CCClient, pool *AccountPool) http.H
 		if body.BaseURL != nil {
 			url := strings.TrimSpace(*body.BaseURL)
 			if url == "" {
-				writeAdminError(w, 400, "base_url cannot be empty")
+				writeAdminError(w, r, 400, "base_url cannot be empty")
 				return
 			}
 			cfg.SetUpstreamBaseURL(url)
@@ -638,7 +664,7 @@ func handleAdminSettingsPut(cfg *Config, cc *CCClient, pool *AccountPool) http.H
 		if body.AdminPassword != nil {
 			password := strings.TrimSpace(*body.AdminPassword)
 			if len(password) < 8 {
-				writeAdminError(w, 400, "admin_password must be at least 8 characters")
+				writeAdminError(w, r, 400, "admin_password must be at least 8 characters")
 				return
 			}
 			// 管理认证就是密码本身：改完即踢出所有已持有的旧凭据。
@@ -660,7 +686,7 @@ func handleAdminSettingsPut(cfg *Config, cc *CCClient, pool *AccountPool) http.H
 		// Keep the persisted config consistent with the live pool.
 		pool.SyncToConfig(cfg)
 		if err := saveConfig(configFile, cfg); err != nil {
-			writeAdminError(w, 500, "applied but saving config failed: "+err.Error())
+			writeAdminError(w, r, 500, "applied but saving config failed: "+err.Error())
 			return
 		}
 		log.Printf("settings updated via webui (restart required: %v)", restartRequired)
@@ -713,7 +739,7 @@ func handleAdminOAuthStart(pool *AccountPool, cfg *Config, quotas *QuotaService)
 		opts := OAuthOptions{}
 		if body.CallbackURL != "" {
 			if err := validateCallbackURL(body.CallbackURL); err != nil {
-				writeAdminError(w, 400, err.Error())
+				writeAdminError(w, r, 400, err.Error())
 				return
 			}
 			// 自定义回调走网关自身的公开回调端点，浏览器可达即可，
@@ -732,7 +758,7 @@ func handleAdminOAuthStart(pool *AccountPool, cfg *Config, quotas *QuotaService)
 		flow, err := StartOAuthFlow(opts)
 		if err != nil {
 			webOAuthMu.Unlock()
-			writeAdminError(w, 500, err.Error())
+			writeAdminError(w, r, 500, err.Error())
 			return
 		}
 		webOAuthFlow = flow
@@ -792,7 +818,7 @@ func handleAdminOAuthStatus(pool *AccountPool) http.HandlerFunc {
 			}
 		case "failed":
 			if err := flow.Err(); err != nil {
-				resp["error"] = err.Error()
+				resp["error"] = i18n.Message(i18n.FromRequest(r), err.Error())
 			}
 		}
 		writeAdminJSON(w, 200, resp)
@@ -830,7 +856,7 @@ func handleWebOAuthCallback() http.HandlerFunc {
 		if r.Method != "POST" {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(405)
-			json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "method not allowed"})
+			json.NewEncoder(w).Encode(map[string]any{"success": false, "error": i18n.Message(i18n.FromRequest(r), "method not allowed")})
 			return
 		}
 
@@ -840,7 +866,7 @@ func handleWebOAuthCallback() http.HandlerFunc {
 		if flow == nil || flow.StateName() != "pending" {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(400)
-			json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "no pending OAuth flow"})
+			json.NewEncoder(w).Encode(map[string]any{"success": false, "error": i18n.Message(i18n.FromRequest(r), "no pending OAuth flow")})
 			return
 		}
 
@@ -848,7 +874,7 @@ func handleWebOAuthCallback() http.HandlerFunc {
 		if err := json.NewDecoder(io.LimitReader(r.Body, 64*1024)).Decode(&cb); err != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(400)
-			json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "invalid JSON"})
+			json.NewEncoder(w).Encode(map[string]any{"success": false, "error": i18n.Message(i18n.FromRequest(r), "invalid JSON")})
 			return
 		}
 		if errMsg, _ := r.URL.Query()["error"]; len(errMsg) > 0 {
@@ -861,14 +887,14 @@ func handleWebOAuthCallback() http.HandlerFunc {
 		if cb.APIKey == "" || cb.State == "" {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(400)
-			json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "缺少必要字段"})
+			json.NewEncoder(w).Encode(map[string]any{"success": false, "error": i18n.Message(i18n.FromRequest(r), "api_key and state are required")})
 			return
 		}
 
 		if err := flow.deliver(cb); err != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(400)
-			json.NewEncoder(w).Encode(map[string]any{"success": false, "error": err.Error()})
+			json.NewEncoder(w).Encode(map[string]any{"success": false, "error": i18n.Message(i18n.FromRequest(r), err.Error())})
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")

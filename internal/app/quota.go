@@ -404,7 +404,7 @@ func fetchQuotaSnapshot(ctx context.Context, client *http.Client, baseURL, apiKe
 	orgID := ""
 	if who, err := quotaGet(ctx, client, base+"/alpha/whoami", apiKey); err != nil {
 		if quotaKeyRejected(err) {
-			return nil, fmt.Errorf("API Key 被拒绝（%v）", err)
+			return nil, fmt.Errorf("API key rejected: %v", err)
 		}
 		failures = append(failures, "whoami: "+err.Error())
 	} else {
@@ -488,9 +488,9 @@ func fetchQuotaSnapshot(ctx context.Context, client *http.Client, baseURL, apiKe
 	}
 	if !snapshotHasData(snap) {
 		if len(failures) == 0 {
-			return nil, fmt.Errorf("额度接口返回空数据")
+			return nil, fmt.Errorf("quota endpoints returned no data")
 		}
-		return nil, fmt.Errorf("所有额度接口均无法访问：%s", strings.Join(failures, "; "))
+		return nil, fmt.Errorf("all quota endpoints failed: %s", strings.Join(failures, "; "))
 	}
 	return snap, nil
 }
