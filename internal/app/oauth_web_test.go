@@ -125,3 +125,95 @@ func TestWebOAuthCallbackIsStateProtected(t *testing.T) {
 		t.Fatalf("status = %d, want 400 (no pending flow)", resp.StatusCode)
 	}
 }
+
+// TestParseCallbackURLExtractsRedirectParams covers the redirect-mode payload a
+// user copies out of the browser: the credential rides in the query string.
+func TestParseCallbackURLExtractsRedirectParams(t *testing.T) {
+	cb, err := ParseCallbackURL("http://127.0.0.1:5959/callback?apiKey=user_abc&state=st1&userId=u1&userName=dev%40example.com&keyName=cli")
+	if err != nil {
+		t.Fatalf("ParseCallbackURL: %v", err)
+	}
+	if cb.APIKey != "user_abc" || cb.State != "st1" || cb.UserName != "dev@example.com" || cb.KeyName != "cli" {
+		t.Fatalf("parsed = %+v", cb)
+	}
+
+	// The auth URL is a common paste mistake; the error must name it.
+	if _, err := ParseCallbackURL(studioBaseURL + "/studio/auth/cli?callback=http%3A%2F%2Flocalhost%3A5959%2Fcallback&state=st1"); err == nil {
+		t.Fatal("pasting the auth URL should be rejected")
+	}
+
+	// A denial carries no credential and must surface as a failure.
+	if _, err := ParseCallbackURL("http://127.0.0.1:5959/callback?error=access_denied&error_description=Denied&state=st1"); err == nil {
+		t.Fatal("denied callback should be rejected")
+	}
+
+	// Missing credential fields.
+	if _, err := ParseCallbackURL("http://127.0.0.1:5959/callback?state=st1"); err == nil {
+		t.Fatal("missing apiKey should be rejected")
+	}
+	if _, err := ParseCallbackURL("   "); err == nil {
+		t.Fatal("blank input should be rejected")
+	}
+}
+
+// TestWebOAuthCompleteFromPastedLink walks the pasted-link path end to end:
+// start a flow, hand the redirect URL to /complete, and observe the account.
+func TestWebOAuthCompleteFromPastedLink(t *testing.T) {
+	srv, pool, _, _, _, _ := newAdminTestEnv(t)
+	t.Cleanup(func() {
+		webOAuthMu.Lock()
+		webOAuthFlow = nil
+		webOAuthMu.Unlock()
+	})
+
+	_, payload := adminRequest(t, srv, "POST", "/admin/api/oauth/start", "admin-pass-123", map[string]any{})
+	authURL := payload["auth_url"].(string)
+	parsed, err := url.Parse(authURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := parsed.Query().Get("state")
+
+	redirect := "http://127.0.0.1:5959/callback?apiKey=user_pasted&state=" + url.QueryEscape(state) +
+		"&userId=u9&userName=pasted%40example.com&keyName=cli"
+
+	// A forged state must not inject an account.
+	resp, body := adminRequest(t, srv, "POST", "/admin/api/oauth/complete", "admin-pass-123",
+		map[string]any{"callback_url": "http://127.0.0.1:5959/callback?apiKey=user_bad&state=wrong&userName=x"})
+	if resp.StatusCode != 400 {
+		t.Fatalf("forged state status = %d: %v", resp.StatusCode, body)
+	}
+	if pool.Get(accountID("user_bad")) != nil {
+		t.Fatal("forged state must not add an account")
+	}
+
+	// The real redirect URL completes the flow and adds the account.
+	resp, body = adminRequest(t, srv, "POST", "/admin/api/oauth/complete", "admin-pass-123",
+		map[string]any{"callback_url": redirect})
+	if resp.StatusCode != 200 {
+		t.Fatalf("complete status = %d: %v", resp.StatusCode, body)
+	}
+	if body["state"] != "success" || body["account_name"] != "pasted@example.com" {
+		t.Fatalf("complete = %v", body)
+	}
+	if pool.Get(accountID("user_pasted")) == nil {
+		t.Fatal("account not in pool after paste")
+	}
+
+	saved := loadConfigForTest(t)
+	found := false
+	for _, a := range saved.CommandCode.Accounts {
+		if a.APIKey == "user_pasted" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("pasted account was not persisted: %+v", saved.CommandCode.Accounts)
+	}
+
+	// The single-use link cannot be replayed.
+	if resp, _ := adminRequest(t, srv, "POST", "/admin/api/oauth/complete", "admin-pass-123",
+		map[string]any{"callback_url": redirect}); resp.StatusCode != 400 {
+		t.Fatalf("replayed link status = %d, want 400", resp.StatusCode)
+	}
+}

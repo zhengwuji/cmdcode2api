@@ -68,9 +68,13 @@ var translations = map[Lang]map[string]string{
 		"no pending OAuth flow":                           "当前没有进行中的 OAuth 授权",
 		"method not allowed":                              "请求方法不允许",
 		"invalid JSON":                                    "JSON 无效",
+		"callback link is required":                       "请粘贴回调链接",
+		"that is the authorization link, not the callback link: finish authorizing in the browser, then copy the link from the address bar": "这是授权链接，不是回调链接：请先在浏览器里完成授权，再复制跳转后地址栏里的链接",
+		"the link is missing apiKey / state: copy the full link from the address bar after the redirect":                                    "链接里缺少 apiKey / state：请复制浏览器跳转后地址栏里的完整链接",
 
 		// quota
 		"quota endpoints returned no data": "额度接口返回空数据",
+		"quota service unavailable":        "额度服务不可用",
 	},
 }
 
@@ -94,6 +98,8 @@ var wrapped = map[Lang]map[string]string{
 		"decode response: ":                        "解析响应失败：",
 		"API key rejected: ":                       "API Key 被拒绝：",
 		"all quota endpoints failed: ":             "所有额度接口均无法访问：",
+		"parse callback link: ":                    "解析回调链接失败：",
+		"authorization denied: ":                   "授权被拒绝：",
 	},
 }
 

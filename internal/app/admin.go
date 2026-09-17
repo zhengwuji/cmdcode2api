@@ -37,6 +37,7 @@ func registerAdminRoutes(mux *http.ServeMux, cc *CCClient, pool *AccountPool, ke
 	mux.HandleFunc("GET /admin/api/logs", handleAdminLogs(ring))
 	mux.HandleFunc("POST /admin/api/oauth/start", handleAdminOAuthStart(pool, cfg, quotas))
 	mux.HandleFunc("GET /admin/api/oauth/status", handleAdminOAuthStatus(pool))
+	mux.HandleFunc("POST /admin/api/oauth/complete", handleAdminOAuthComplete(pool, cfg, quotas))
 	mux.HandleFunc("POST /admin/api/oauth/cancel", handleAdminOAuthCancel())
 }
 
@@ -770,23 +771,11 @@ func handleAdminOAuthStart(pool *AccountPool, cfg *Config, quotas *QuotaService)
 				log.Printf("[WARN] webui oauth flow ended: %v", err)
 				return
 			}
-			name := cb.displayName()
-			if name == "" {
-				name = "oauth"
-			}
-			acct, err := pool.Add(name, cb.APIKey, true)
+			acct, err := addOAuthAccount(pool, cfg, quotas, cb)
 			if err != nil {
 				log.Printf("[WARN] webui oauth: add account failed: %v", err)
 				return
 			}
-			if err := persistPool(pool, cfg); err != nil {
-				log.Printf("[WARN] webui oauth: save config failed: %v", err)
-				return
-			}
-			if len(modelCatalog) == 0 && acct.Enabled {
-				FetchProviderModels(cfg.UpstreamBaseURL(), acct.APIKey)
-			}
-			quotas.RefreshAsync(acct)
 			log.Printf("✓ OAuth account %q added via webui (user %s)", acct.Name, cb.UserName)
 		}()
 
@@ -835,6 +824,80 @@ func handleAdminOAuthCancel() http.HandlerFunc {
 			flow.Cancel()
 		}
 		writeAdminJSON(w, 200, map[string]any{"canceled": true})
+	}
+}
+
+// addOAuthAccount turns a completed callback into a configured account, then
+// persists it. Shared by the redirect callback and the pasted-link path.
+func addOAuthAccount(pool *AccountPool, cfg *Config, quotas *QuotaService, cb oauthCallback) (*Account, error) {
+	name := cb.displayName()
+	if name == "" {
+		name = "oauth"
+	}
+	acct, err := pool.Add(name, cb.APIKey, true)
+	if err != nil {
+		return nil, err
+	}
+	if err := persistPool(pool, cfg); err != nil {
+		return nil, err
+	}
+	if len(modelCatalog) == 0 && acct.Enabled {
+		FetchProviderModels(cfg.UpstreamBaseURL(), acct.APIKey)
+	}
+	quotas.RefreshAsync(acct)
+	return acct, nil
+}
+
+// handleAdminOAuthComplete finishes a pending flow from a callback URL the user
+// copied out of their browser. When the browser cannot reach the server's
+// 127.0.0.1 listener (remote or containerized deployments), Command Code
+// redirects to the callback with the credential in the query string; pasting
+// that link here is the manual equivalent of letting the redirect land.
+//
+// The URL is parsed locally, never fetched: the gateway must not issue
+// attacker-directed requests. The single-use state token still has to match the
+// pending flow, so a forged link cannot inject an account.
+func handleAdminOAuthComplete(pool *AccountPool, cfg *Config, quotas *QuotaService) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			CallbackURL string `json:"callback_url"`
+		}
+		if err := decodeJSONBody(w, r, &body); err != nil {
+			writeAdminError(w, r, 400, err.Error())
+			return
+		}
+
+		cb, err := ParseCallbackURL(body.CallbackURL)
+		if err != nil {
+			writeAdminError(w, r, 400, err.Error())
+			return
+		}
+
+		webOAuthMu.Lock()
+		flow := webOAuthFlow
+		webOAuthMu.Unlock()
+		if flow == nil {
+			writeAdminError(w, r, 400, "no pending OAuth flow")
+			return
+		}
+		if flow.StateName() != "pending" {
+			writeAdminError(w, r, 400, "OAuth flow is no longer pending")
+			return
+		}
+		// deliver verifies the single-use state token and closes the flow, so the
+		// same link cannot be replayed and a forged link cannot add an account.
+		if err := flow.deliver(cb); err != nil {
+			writeAdminError(w, r, 400, err.Error())
+			return
+		}
+
+		acct, err := addOAuthAccount(pool, cfg, quotas, cb)
+		if err != nil {
+			writeAdminError(w, r, 500, err.Error())
+			return
+		}
+		log.Printf("✓ OAuth account %q added via pasted callback link (user %s)", acct.Name, cb.UserName)
+		writeAdminJSON(w, 200, map[string]any{"state": "success", "account_id": acct.ID, "account_name": acct.Name})
 	}
 }
 

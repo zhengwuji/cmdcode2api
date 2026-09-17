@@ -179,11 +179,6 @@
   }
   .modal h3 { margin: 0 0 14px; font-size: 15px; }
   .modal .status-line { margin: 12px 0; font-size: 13px; color: var(--text-dim); }
-  .modal .oauth-url {
-    background: #0d1117; border: 1px solid var(--border); border-radius: 8px;
-    padding: 10px 12px; font-family: var(--mono); font-size: 12px;
-    word-break: break-all; margin: 10px 0; color: var(--accent);
-  }
   .modal .hint { color: var(--text-faint); font-size: 12.5px; line-height: 1.7; margin: 12px 0 0; }
   .modal .modal-err { color: var(--red); font-size: 12.5px; min-height: 18px; margin: 0 0 6px; }
 
@@ -489,22 +484,29 @@
 <div class="modal-mask" id="oauth-modal" style="display:none">
   <div class="modal">
     <h3 data-i18n="oauth.title">Add account via OAuth</h3>
-    <label class="field">
-      <span class="cap" data-i18n="oauth.callbackLabel">Callback URL (optional; fill in for remote / container deployments)</span>
-      <input type="text" id="oauth-callback" class="mono" placeholder="">
-    </label>
-    <p class="hint" style="margin:0 0 12px" data-i18n-html="oauth.hint">Leave blank to use the server-local <code>127.0.0.1:5959-5968</code> callback (works when the browser runs on the same host). If the browser cannot reach those ports (remote deployment), enter a <strong>browser-reachable</strong> address of this service, e.g. <code id="oauth-callback-hint"></code>.</p>
-    <div class="oauth-url" id="oauth-url" style="display:none"></div>
     <div class="form-row" id="oauth-begin-row" style="margin-bottom:6px">
       <button class="btn primary" id="oauth-begin" data-i18n="oauth.begin">Start authorization</button>
       <span class="spacer" style="flex:1"></span>
       <button class="btn" id="oauth-cancel" data-i18n="common.close">Close</button>
     </div>
-    <div class="form-row" id="oauth-open-row" style="margin-bottom:6px;display:none">
-      <a class="btn primary" id="oauth-open" href="#" target="_blank" rel="noopener" data-i18n="oauth.open">Open authorization page</a>
-      <button class="btn" id="oauth-copy" data-i18n="oauth.copyLink">Copy link</button>
+    <div id="oauth-open-row" style="display:none">
+      <div class="form-row" style="margin-bottom:10px">
+        <a class="btn primary" id="oauth-open" href="#" target="_blank" rel="noopener" data-i18n="oauth.open">Open authorization page</a>
+        <button class="btn" id="oauth-copy" data-i18n="oauth.copyLink">Copy link</button>
+        <span class="spacer" style="flex:1"></span>
+        <button class="btn" id="oauth-cancel2" data-i18n="common.cancel">Cancel</button>
+      </div>
+      <label class="field" style="margin-bottom:12px">
+        <span class="cap" data-i18n="oauth.pasteLabel">Callback link (the address the browser lands on after authorizing)</span>
+        <input type="text" id="oauth-callback" class="mono" data-i18n-ph="oauth.pastePlaceholder" placeholder="http://127.0.0.1:5959/callback?apiKey=…&state=…">
+      </label>
+      <div class="form-row">
+        <button class="btn primary" id="oauth-complete-btn" data-i18n="oauth.complete">Submit callback link</button>
+      </div>
+    <div class="form-row" id="oauth-begin-row" style="margin-bottom:6px">
+      <button class="btn primary" id="oauth-begin" data-i18n="oauth.begin">Start authorization</button>
       <span class="spacer" style="flex:1"></span>
-      <button class="btn" id="oauth-cancel2" data-i18n="common.cancel">Cancel</button>
+      <button class="btn" id="oauth-cancel" data-i18n="common.close">Close</button>
     </div>
     <div class="status-line" id="oauth-status" style="display:none"></div>
   </div>
@@ -716,15 +718,19 @@ const I18N = {
     "logs.empty": "No logs yet",
 
     "oauth.title": "Add account via OAuth",
-    "oauth.callbackLabel": "Callback URL (optional; fill in for remote / container deployments)",
-    "oauth.hint": "Leave blank to use the server-local <code>127.0.0.1:5959-5968</code> callback (works when the browser runs on the same host). If the browser cannot reach those ports (remote deployment), enter a <strong>browser-reachable</strong> address of this service, e.g. <code id=\"oauth-callback-hint\"></code>.",
     "oauth.begin": "Start authorization",
     "oauth.open": "Open authorization page",
     "oauth.copyLink": "Copy link",
-    "oauth.linkCopied": "Link copied.",
     "oauth.running": "Authorization already in progress, waiting for the callback…",
-    "oauth.waitingCustom": "Waiting for the Command Code page to return credentials to the callback URL you entered…",
     "oauth.waiting": "Waiting for authorization…",
+    "oauth.pasteLabel": "Callback link (the address the browser lands on after authorizing)",
+    "oauth.pastePlaceholder": "http://127.0.0.1:5959/callback?apiKey=…&state=…",
+    "oauth.complete": "Submit callback link",
+    "oauth.completing": "Submitting…",
+    "oauth.pasteRequired": "Paste the callback link first",
+    "oauth.authLinkCopied": "Authorization link copied",
+    "oauth.copyFailed": "Copy failed — select the link manually",
+    "oauth.linkMissing": "The authorization link has not been generated yet",
     "oauth.success": "✅ Authorization succeeded, account \"{name}\" added",
     "oauth.failed": "❌ Authorization failed: {error}",
     "oauth.unknownError": "unknown error",
@@ -923,15 +929,19 @@ const I18N = {
     "logs.empty": "暂无日志",
 
     "oauth.title": "通过 OAuth 添加账号",
-    "oauth.callbackLabel": "回调地址（可选，远程 / 容器部署时填写）",
-    "oauth.hint": "留空 = 使用服务器本地 <code>127.0.0.1:5959-5968</code> 回调（浏览器与服务器同机时可用）。浏览器无法访问服务器该端口时（远程部署），填一个<strong>浏览器可达</strong>的本服务地址，例如 <code id=\"oauth-callback-hint\"></code>。",
     "oauth.begin": "开始授权",
     "oauth.open": "打开授权页面",
     "oauth.copyLink": "复制链接",
-    "oauth.linkCopied": "链接已复制",
     "oauth.running": "已有授权流程进行中，等待回调…",
-    "oauth.waitingCustom": "等待 Command Code 页面向你填写的回调地址回传凭据…",
     "oauth.waiting": "等待授权完成…",
+    "oauth.pasteLabel": "回调链接（浏览器授权后跳转的地址）",
+    "oauth.pastePlaceholder": "http://127.0.0.1:5959/callback?apiKey=…&state=…",
+    "oauth.complete": "提交回调链接",
+    "oauth.completing": "提交中…",
+    "oauth.pasteRequired": "请粘贴回调链接",
+    "oauth.authLinkCopied": "授权链接已复制",
+    "oauth.copyFailed": "复制失败，请手动选择链接",
+    "oauth.linkMissing": "授权链接尚未生成",
     "oauth.success": "✅ 授权成功，账号「{name}」已添加",
     "oauth.failed": "❌ 授权失败：{error}",
     "oauth.unknownError": "未知错误",
@@ -1730,33 +1740,59 @@ async function loadLogs() {
 
 function openOAuthModal() {
   if ($("#acc-add-modal").style.display !== "none") hideModal("#acc-add-modal");
+  stopOAuthPolling();
   $("#oauth-callback").value = "";
-  const hint = $("#oauth-callback-hint");
-  if (hint) hint.textContent = location.origin + "/admin/api/oauth/callback";
-  $("#oauth-callback").placeholder = location.origin + "/admin/api/oauth/callback";
-  $("#oauth-url").style.display = "none";
-  $("#oauth-status").style.display = "none";
   $("#oauth-begin-row").style.display = "";
   $("#oauth-open-row").style.display = "none";
+  $("#oauth-status").style.display = "none";
+  $("#oauth-complete-btn").disabled = false;
+  $("#oauth-complete-btn").textContent = t("oauth.complete");
   $("#oauth-modal").style.display = "";
 }
 
 function startOAuth() {
-  const callbackURL = $("#oauth-callback").value.trim();
-  api("/admin/api/oauth/start", { method: "POST", body: { callback_url: callbackURL } }).then(r => {
-    $("#oauth-url").textContent = r.auth_url;
+  api("/admin/api/oauth/start", { method: "POST", body: {} }).then(r => {
     $("#oauth-open").href = r.auth_url;
-    $("#oauth-url").style.display = "";
     $("#oauth-begin-row").style.display = "none";
     $("#oauth-open-row").style.display = "";
     $("#oauth-status").style.display = "";
     $("#oauth-status").innerHTML = r.already_running
       ? `<span class="spinner"></span>${esc(t("oauth.running"))}`
-      : (callbackURL
-        ? `<span class="spinner"></span>${esc(t("oauth.waitingCustom"))}`
-        : `<span class="spinner"></span>${esc(t("oauth.waiting"))}`);
+      : `<span class="spinner"></span>${esc(t("oauth.waiting"))}`;
     startOAuthPolling();
   }).catch(e => toast(e.message, true));
+}
+
+// submitOAuthCallback hands the pasted redirect URL to the server, which parses
+// the credential out of it and finishes the pending flow. Used when the
+// browser cannot reach the server's own callback listener.
+async function submitOAuthCallback() {
+  const url = $("#oauth-callback").value.trim();
+  const btn = $("#oauth-complete-btn");
+  if (!url) { toast(t("oauth.pasteRequired"), true); $("#oauth-callback").focus(); return; }
+  btn.disabled = true;
+  btn.textContent = t("oauth.completing");
+  try {
+    const r = await api("/admin/api/oauth/complete", { method: "POST", body: { callback_url: url } });
+    stopOAuthPolling();
+    $("#oauth-status").style.display = "";
+    $("#oauth-status").innerHTML = esc(t("oauth.success", { name: r.account_name || "" }));
+    refreshAll();
+    setTimeout(closeOAuth, 1400);
+  } catch (e) {
+    toast(e.message, true);
+    btn.disabled = false;
+    btn.textContent = t("oauth.complete");
+  }
+}
+
+async function copyOAuthLink() {
+  const href = $("#oauth-open").href;
+  if (!href || href === "#" || href.endsWith("#")) { toast(t("oauth.linkMissing"), true); return; }
+  try {
+    await navigator.clipboard.writeText(href);
+    toast(t("oauth.authLinkCopied"));
+  } catch (e) { toast(t("oauth.copyFailed"), true); }
 }
 
 function startOAuthPolling() {
@@ -1835,9 +1871,9 @@ document.addEventListener("keydown", e => {
 $("#model-search").addEventListener("input", renderModels);
 $("#model-all-btn").addEventListener("click", () => setAllModels(true));
 $("#model-none-btn").addEventListener("click", () => setAllModels(false));
-$("#oauth-copy").addEventListener("click", () => {
-  navigator.clipboard.writeText($("#oauth-url").textContent).then(() => toast(t("oauth.linkCopied")));
-});
+$("#oauth-copy").addEventListener("click", copyOAuthLink);
+$("#oauth-complete-btn").addEventListener("click", submitOAuthCallback);
+$("#oauth-callback").addEventListener("keydown", e => { if (e.key === "Enter") submitOAuthCallback(); });
 $("#oauth-cancel").addEventListener("click", () => {
   api("/admin/api/oauth/cancel", { method: "POST" }).catch(() => {});
   closeOAuth();

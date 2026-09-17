@@ -377,6 +377,53 @@ Waiting for authorization, timeout: %s
 	return cb, nil
 }
 
+// ParseCallbackURL reads a callback payload out of the URL the browser was
+// redirected to. Command Code's redirect mode delivers the credential as
+// query parameters (?apiKey=…&state=…&userId=…&userName=…&keyName=…), which is
+// what a user copies out of the address bar when their browser cannot reach
+// the server's 127.0.0.1 listener. The payload is extracted locally: the
+// gateway never fetches the pasted URL, so an attacker-supplied link cannot
+// turn this into a request forgery, and the state check below still applies.
+//
+// Messages are English sources so i18n.Message can localize them; this
+// function has no request context of its own.
+func ParseCallbackURL(rawURL string) (oauthCallback, error) {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return oauthCallback{}, fmt.Errorf("callback link is required")
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return oauthCallback{}, fmt.Errorf("parse callback link: %w", err)
+	}
+	q := parsed.Query()
+
+	// The auth URL is the page that leads to the callback; pasting it by
+	// mistake is common, so name the problem precisely.
+	if q.Get("callback") != "" && q.Get("apiKey") == "" {
+		return oauthCallback{}, fmt.Errorf("that is the authorization link, not the callback link: finish authorizing in the browser, then copy the link from the address bar")
+	}
+	if errMsg := q.Get("error"); errMsg != "" {
+		desc := q.Get("error_description")
+		if desc == "" {
+			desc = errMsg
+		}
+		return oauthCallback{}, fmt.Errorf("authorization denied: %s", desc)
+	}
+
+	cb := oauthCallback{
+		APIKey:   q.Get("apiKey"),
+		State:    q.Get("state"),
+		UserID:   q.Get("userId"),
+		UserName: q.Get("userName"),
+		KeyName:  q.Get("keyName"),
+	}
+	if cb.APIKey == "" || cb.State == "" {
+		return oauthCallback{}, fmt.Errorf("the link is missing apiKey / state: copy the full link from the address bar after the redirect")
+	}
+	return cb, nil
+}
+
 func validateCallbackURL(rawURL string) error {
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
