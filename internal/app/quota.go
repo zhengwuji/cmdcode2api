@@ -25,7 +25,6 @@ const (
 	quotaRefreshInterval = 5 * time.Minute
 	quotaRequestTimeout  = 15 * time.Second
 	quotaRefreshWorkers  = 4
-	quotaUserAgent       = "cmdcode2api/" + Version
 )
 
 // QuotaWindow is one server-side rolling limit (the 5-hour and weekly windows).
@@ -360,9 +359,8 @@ func quotaGet(ctx context.Context, client *http.Client, rawURL, apiKey string) (
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", quotaUserAgent)
+	setCCHeaders(req.Header, apiKey)
 
 	resp, err := client.Do(req)
 	if err != nil {

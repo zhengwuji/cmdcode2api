@@ -82,6 +82,7 @@ type quotaTestUpstream struct {
 	requests []string
 	auths    []string
 	agents   []string
+	versions []string
 	accepts  []string
 }
 
@@ -95,6 +96,7 @@ func (u *quotaTestUpstream) record(r *http.Request) {
 	u.requests = append(u.requests, target)
 	u.auths = append(u.auths, r.Header.Get("Authorization"))
 	u.agents = append(u.agents, r.Header.Get("User-Agent"))
+	u.versions = append(u.versions, r.Header.Get("x-command-code-version"))
 	u.accepts = append(u.accepts, r.Header.Get("Accept"))
 }
 
@@ -177,8 +179,11 @@ func TestFetchQuotaSnapshotHappyPath(t *testing.T) {
 		if up.accepts[i] != "application/json" {
 			t.Fatalf("request %d accept = %q", i, up.accepts[i])
 		}
-		if !strings.HasPrefix(up.agents[i], "cmdcode2api/") {
-			t.Fatalf("request %d user-agent = %q", i, up.agents[i])
+		if up.agents[i] != ccUserAgent {
+			t.Fatalf("request %d user-agent = %q, want %q", i, up.agents[i], ccUserAgent)
+		}
+		if up.versions[i] != ccCLIVersion {
+			t.Fatalf("request %d x-command-code-version = %q, want %q", i, up.versions[i], ccCLIVersion)
 		}
 	}
 }

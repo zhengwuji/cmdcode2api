@@ -371,3 +371,45 @@ func TestParseStreamEventsRejectsMalformedData(t *testing.T) {
 		}
 	}
 }
+
+// TestUpstreamClientIdentityHeaders pins the headers the gateway presents to
+// Command Code. The generation path and the quota path must agree, otherwise
+// the upstream sees two different clients under one API key.
+func TestUpstreamClientIdentityHeaders(t *testing.T) {
+	var got http.Header
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer srv.Close()
+
+	client := NewCCClient("cc-key", srv.URL)
+	req := &ChatRequest{
+		Model:    "claude-sonnet-4-5",
+		Messages: []Message{{Role: "user", Content: TextContent("hi")}},
+	}
+	resp, _, err := client.Send(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	resp.Body.Close()
+
+	want := map[string]string{
+		"x-command-code-version": ccCLIVersion,
+		"x-cli-environment":      ccCLIEnvironment,
+		"User-Agent":             ccUserAgent,
+		"Authorization":          "Bearer cc-key",
+	}
+	for k, v := range want {
+		if got.Get(k) != v {
+			t.Errorf("%s = %q, want %q", k, got.Get(k), v)
+		}
+	}
+
+	// The reported CLI version must track a real command-code release rather
+	// than drifting arbitrarily; keep it parseable as a dotted version.
+	if !strings.Contains(ccCLIVersion, ".") {
+		t.Errorf("ccCLIVersion = %q, want a dotted version", ccCLIVersion)
+	}
+}

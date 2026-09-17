@@ -64,7 +64,7 @@ With an empty data directory the first start generates `config.yaml`, prints the
 
 Open `/webui`, go to the **Accounts** tab, and paste a Command Code API key. This works regardless of container networking or SSH access.
 
-The Accounts tab can also run the OAuth flow. By default it uses the server's local `127.0.0.1:5959-5968` callback ports, which works out of the box when the browser runs on the same machine. For remote or containerized deployments, fill in the **callback URL** field with an address the browser can reach — the gateway's own `http://<server>:11434/admin/api/oauth/callback` is the usual choice. The Command Code page then posts the credential there; the transfer is protected by a single-use state token.
+The Accounts tab can also run the OAuth flow. It uses the server's local `127.0.0.1:5959-5968` callback ports, which works out of the box when the browser runs on the same machine. When it does not — remote or containerized deployments, or a browser that cannot reach that port — the Command Code page cannot hand the credential back automatically. In that case the page stops on a URL carrying the credential in its query string (`?apiKey=…&state=…`); paste that whole address-bar link into the **回调链接** field and submit it. The gateway parses the credential out of the link locally (it never fetches the URL), and the single-use state token still has to match the pending flow, so a forged link cannot inject an account.
 
 ### CLI OAuth
 
@@ -191,7 +191,7 @@ Log in with the server address and `admin_password`. The same `internal/web/inde
 Tabs:
 
 - **Overview** — version, uptime, listen address, usage counters, account/key/model summaries, and a quota sync summary (synced / exceeded / low-balance accounts, last refresh)
-- **Accounts** — add (paste a key or run OAuth with an optional callback URL), edit name/key, enable/disable, connectivity test, quota refresh, delete; per-account requests, tokens, errors, cooldown state, last error, and quota. OAuth-added accounts are named after the Command Code user automatically
+- **Accounts** — add (paste a key, or run OAuth and paste the redirect link when the browser cannot reach the server), edit name/key, enable/disable, connectivity test, quota refresh, delete; per-account requests, tokens, errors, cooldown state, last error, and quota. OAuth-added accounts are named after the Command Code user automatically
 - **Models** — checkbox list of upstream models; checked = exposed via `/v1/models` and callable, unchecked = hidden. This is the editor for `exclude_models` and applies live
 - **Keys** — create local client API keys, enable/disable, copy, delete; per-key usage (see [Client keys](#client-keys))
 - **Settings** — edit `base_url` (live), `host`/`port`/`webui` (persisted, applied on restart), and change the admin password (requires the current password; every existing admin session is kicked afterwards)
@@ -236,6 +236,7 @@ GET    /admin/api/settings
 PUT    /admin/api/settings
 GET    /admin/api/logs?after=SEQ
 POST   /admin/api/oauth/start
+POST   /admin/api/oauth/complete   {"callback_url": "<浏览器跳转后的完整链接>"}
 GET    /admin/api/oauth/status
 POST   /admin/api/oauth/cancel
 ```

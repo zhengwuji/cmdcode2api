@@ -277,15 +277,23 @@ func shouldFailover(err error) bool {
 	return true
 }
 
+// setCCHeaders applies the headers the official Command Code CLI sends. Both
+// the generation path and the quota path go through it so the client identity
+// stays identical across every upstream call.
+func setCCHeaders(h http.Header, apiKey string) {
+	h.Set("Authorization", "Bearer "+apiKey)
+	h.Set("x-command-code-version", ccCLIVersion)
+	h.Set("x-cli-environment", ccCLIEnvironment)
+	h.Set("User-Agent", ccUserAgent)
+}
+
 func (c *CCClient) doSend(ctx context.Context, body []byte, apiKey string) (*http.Response, error) {
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.BaseURLValue()+"/alpha/generate", bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+apiKey)
-	httpReq.Header.Set("x-command-code-version", "0.24.1")
-	httpReq.Header.Set("x-cli-environment", "production")
+	setCCHeaders(httpReq.Header, apiKey)
 
 	resp, err := c.Client.Do(httpReq)
 	if err != nil {
@@ -345,6 +353,22 @@ func decodeSSEEvent(payload string) (CCStreamEvent, error) {
 	}
 	return ev, nil
 }
+
+// ccCLIVersion is reported as x-command-code-version on every upstream request.
+// Command Code does not currently reject stale values (nor a missing header),
+// but the field identifies the client on their side, so keep it close to the
+// command-code release the wire format below was verified against.
+// Last verified against command-code 1.54.2 (/alpha/generate, tool-call and
+// reasoning events, /alpha/whoami, /alpha/billing/* and /alpha/usage/summary).
+const ccCLIVersion = "1.54.2"
+
+// ccCLIEnvironment mirrors the official CLI's x-cli-environment value.
+const ccCLIEnvironment = "production"
+
+// ccUserAgent matches the official CLI, which sends the literal "cli".
+// The upstream keys its request handling off the CLI headers, so staying
+// identical to the real client is safer than advertising ourselves.
+const ccUserAgent = "cli"
 
 type streamEndKind uint8
 
