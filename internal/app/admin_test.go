@@ -136,7 +136,7 @@ func TestAdminAccountLifecycle(t *testing.T) {
 	if payload["status"] != "disabled" {
 		t.Fatalf("patched status = %v, want disabled", payload["status"])
 	}
-	if pool.Get(id).Enabled {
+	if pool.Get(id).IsEnabled() {
 		t.Fatal("account still enabled in pool")
 	}
 
@@ -332,7 +332,7 @@ func TestAdminClientKeyLifecycle(t *testing.T) {
 	if payload["enabled"] != false {
 		t.Fatalf("patched = %v", payload)
 	}
-	if keys.Get(id).Enabled {
+	if keys.Get(id).IsEnabled() {
 		t.Fatal("key still enabled in pool")
 	}
 

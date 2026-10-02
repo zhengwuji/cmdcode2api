@@ -8,13 +8,25 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
 const maxChatRequestBytes = 50 * 1024 * 1024
 
-var debugMode bool
+// maxDebugBodyLogBytes bounds how much of a request body --debug dumps to the
+// log. The body limit is 50 MB (maxChatRequestBytes), and an inline base64
+// image is enough to fill it; logging the whole thing buried the rest of the
+// log and could grow the ring buffer to tens of megabytes per request.
+const maxDebugBodyLogBytes = 8 * 1024
+
+// debugMode is the process-wide --debug switch. It is atomic because request
+// handlers read it while the flag is parsed at startup.
+var debugMode atomic.Bool
+
+func debugEnabled() bool { return debugMode.Load() }
 
 func handleChatCompletions(cc *CCClient, cfg *Config, usage *UsageTracker) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -27,7 +39,9 @@ func handleChatCompletions(cc *CCClient, cfg *Config, usage *UsageTracker) http.
 				writeError(w, 400, "invalid_request_error", "bad request body: "+err.Error())
 				return
 			}
-			log.Printf("%s %s %s", colorize("[DEBUG]", ansiDim), colorize(">> body", ansiGreen), colorize(string(bodyBytes), ansiCyan))
+			log.Printf("%s %s %s", colorize("[DEBUG]", ansiDim), colorize(">> body", ansiGreen),
+				colorize(truncateForLog(string(bodyBytes), maxDebugBodyLogBytes), ansiCyan))
+			warnUnsupportedParams(bodyBytes)
 			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -46,6 +60,12 @@ func handleChatCompletions(cc *CCClient, cfg *Config, usage *UsageTracker) http.
 		if len(req.Messages) == 0 {
 			writeError(w, 400, "invalid_request_error", "messages is required")
 			return
+		}
+		if budget := req.OutputTokenBudget(); budget > maximumCCMaxTokens {
+			// The upstream rejects anything above the cap, so the value is
+			// clamped rather than rejected; tell the caller what it will get.
+			log.Printf("%s max_tokens %d exceeds the %d upstream cap; clamping", colorize("[WARN]", ansiYellow), budget, maximumCCMaxTokens)
+			w.Header().Set("x-cmdcode2api-max-tokens-clamped", strconv.Itoa(maximumCCMaxTokens))
 		}
 
 		resp, acct, err := cc.Send(r.Context(), &req)
@@ -78,9 +98,8 @@ func handleChatCompletions(cc *CCClient, cfg *Config, usage *UsageTracker) http.
 		} else {
 			handleNonStream(w, resp, req.Model, usage.RecorderFor(acct, clientKeyIDFrom(r.Context())), cfg)
 		}
-		if err := usage.save(); err != nil {
-			log.Printf("%s save usage failed: %v", colorize("[ERROR]", ansiRed), err)
-		}
+		// Persistence is debounced by the background flusher; just flag it.
+		usage.markDirty()
 	}
 }
 
@@ -99,7 +118,11 @@ func handleStreamWithOptions(w http.ResponseWriter, resp *http.Response, model s
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
-	streamID := genStreamID()
+	streamID, err := genStreamID()
+	if err != nil {
+		writeError(w, 500, "server_error", err.Error())
+		return
+	}
 	created := time.Now().Unix()
 	firstText := true
 	var done bool      // [DONE] has been written; nothing more may be emitted
@@ -205,7 +228,7 @@ func handleStreamWithOptions(w http.ResponseWriter, resp *http.Response, model s
 		}
 		fmt.Fprint(w, "data: [DONE]\n\n")
 		done = true
-		if debugMode {
+		if debugEnabled() {
 			log.Printf("%s %s", colorize("[DEBUG]", ansiDim), colorize(">> [DONE]", ansiGreen))
 		}
 		flusher.Flush()
@@ -219,7 +242,7 @@ func handleStreamWithOptions(w http.ResponseWriter, resp *http.Response, model s
 		writeSSEError(w, flusher, code, message)
 		fmt.Fprint(w, "data: [DONE]\n\n")
 		done = true
-		if debugMode {
+		if debugEnabled() {
 			log.Printf("%s %s", colorize("[DEBUG]", ansiDim), colorize(">> [DONE]", ansiGreen))
 		}
 		flusher.Flush()
@@ -350,8 +373,13 @@ func handleNonStream(w http.ResponseWriter, resp *http.Response, model string, u
 	promptTokens, completionTokens, cacheRead, cacheWrite := normalizer.FinalUsage()
 	usage.Record(promptTokens, completionTokens, cacheRead, cacheWrite)
 
+	responseID, err := genStreamID()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "server_error", err.Error())
+		return
+	}
 	res := ChatResponse{
-		ID:      genStreamID(),
+		ID:      responseID,
 		Object:  "chat.completion",
 		Created: time.Now().Unix(),
 		Model:   model,
@@ -376,8 +404,9 @@ func handleModels(cfg *Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		excludes := cfg.Excludes()
-		filtered := make([]ModelInfo, 0, len(modelCatalog))
-		for _, m := range modelCatalog {
+		catalog := modelSnapshot()
+		filtered := make([]ModelInfo, 0, len(catalog))
+		for _, m := range catalog {
 			if !isModelExcluded(m.ID, excludes) {
 				filtered = append(filtered, m)
 			}
@@ -393,7 +422,7 @@ func writeError(w http.ResponseWriter, status int, typ, msg string) {
 }
 
 func writeErrorWithCode(w http.ResponseWriter, status int, typ, code, msg string) {
-	if debugMode {
+	if debugEnabled() {
 		log.Printf("%s %s %d %s: %s", colorize("[DEBUG]", ansiDim), colorize(">> error", ansiRed), status, typ, msg)
 	}
 	errorBody := map[string]any{
@@ -411,11 +440,12 @@ func writeErrorWithCode(w http.ResponseWriter, status int, typ, code, msg string
 
 func writeSSE(w http.ResponseWriter, flusher http.Flusher, chunk ChatStreamChunk) {
 	data, _ := json.Marshal(chunk)
-	if debugMode {
+	if debugEnabled() {
 		log.Printf("%s %s %s", colorize("[DEBUG]", ansiDim), colorize(">> sse", ansiGreen), colorize(string(data), ansiCyan))
 	}
 	fmt.Fprintf(w, "data: %s\n\n", data)
 	flusher.Flush()
+	renewWriteDeadline(w)
 }
 
 func writeSSEError(w http.ResponseWriter, flusher http.Flusher, code, message string) {
@@ -426,11 +456,29 @@ func writeSSEError(w http.ResponseWriter, flusher http.Flusher, code, message st
 		"param":   nil,
 	}}
 	data, _ := json.Marshal(payload)
-	if debugMode {
+	if debugEnabled() {
 		log.Printf("%s %s %s", colorize("[DEBUG]", ansiDim), colorize(">> sse error", ansiRed), colorize(string(data), ansiCyan))
 	}
 	fmt.Fprintf(w, "data: %s\n\n", data)
 	flusher.Flush()
+	renewWriteDeadline(w)
+}
+
+// streamWriteTimeout is how far ahead each streamed chunk pushes the write
+// deadline. http.Server.WriteTimeout is a single absolute deadline for the
+// whole response, so a stream that outlives it is cut off mid-turn; renewing
+// per chunk keeps an active stream alive while still expiring one that stalls.
+const streamWriteTimeout = 10 * time.Minute
+
+// renewWriteDeadline extends the response write deadline after a chunk has been
+// flushed. It is a no-op when the ResponseWriter does not expose deadline
+// control (httptest, HTTP/2 responses already closed, wrapped writers without
+// Unwrap).
+func renewWriteDeadline(w http.ResponseWriter) {
+	rc := http.NewResponseController(w)
+	if err := rc.SetWriteDeadline(time.Now().Add(streamWriteTimeout)); err != nil {
+		return
+	}
 }
 
 func streamEventText(ev CCStreamEvent) string {
@@ -475,10 +523,57 @@ func normalizeFinishReason(reason string) (string, error) {
 	}
 }
 
-func genStreamID() string {
+func genStreamID() (string, error) {
 	id, err := randomHex(18)
 	if err != nil {
-		panic(err)
+		return "", fmt.Errorf("generate stream id: %w", err)
 	}
-	return "chatcmpl-" + id
+	return "chatcmpl-" + id, nil
+}
+
+// truncateForLog caps a debug payload and marks the elision, so a 50 MB body
+// cannot flood the log or the in-memory ring buffer.
+func truncateForLog(s string, limit int) string {
+	if len(s) <= limit {
+		return s
+	}
+	return fmt.Sprintf("%s… (%d bytes elided)", s[:limit], len(s)-limit)
+}
+
+// droppedOpenAIParams are the request fields this gateway accepts in the schema
+// but cannot forward: the Command Code wire format has no equivalent. They are
+// listed rather than rejected so existing clients keep working, but a silent
+// drop makes a caller's tuned sampling look applied when it is not, so --debug
+// logs exactly which ones arrived.
+var droppedOpenAIParams = []string{
+	"temperature",
+	"top_p",
+	"stop",
+	"seed",
+	"response_format",
+	"n",
+	"presence_penalty",
+	"frequency_penalty",
+	"logit_bias",
+	"logprobs",
+	"top_logprobs",
+	"user",
+}
+
+func warnUnsupportedParams(body []byte) {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return
+	}
+	var present []string
+	for _, name := range droppedOpenAIParams {
+		if _, ok := raw[name]; ok {
+			present = append(present, name)
+		}
+	}
+	if len(present) == 0 {
+		return
+	}
+	log.Printf("%s unsupported request parameters dropped (no Command Code equivalent): %s",
+		colorize("[WARN]", ansiYellow), strings.Join(present, ", "))
 }

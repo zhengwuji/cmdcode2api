@@ -1,0 +1,12 @@
+# Encoding and line-ending rules for the launcher scripts.
+#
+# *.ps1 — start.bat runs these with powershell.exe (Windows PowerShell 5.1),
+# which decodes a BOM-less script using the ANSI codepage (GBK on zh-CN
+# Windows). A script holding Chinese messages then tokenizes into garbage and
+# fails with "数组索引表达式缺失或无效" / "字符串缺少终止符". Keep the UTF-8 BOM
+# in every .ps1 and keep the working tree LF.
+*.ps1 text eol=lf
+
+# *.bat — cmd.exe reads batch files with the codepage active at parse time and
+# its label/goto handling is only reliable with CRLF endings.
+*.bat text eol=crlf

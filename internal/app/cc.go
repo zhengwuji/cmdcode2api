@@ -40,7 +40,30 @@ func NewCCClientWithPool(pool *AccountPool, baseURL string) *CCClient {
 	return &CCClient{
 		Pool:    pool,
 		BaseURL: baseURL,
-		Client:  &http.Client{Timeout: 600 * time.Second},
+		Client:  newUpstreamHTTPClient(),
+	}
+}
+
+// newUpstreamHTTPClient builds the shared client for Command Code calls.
+//
+// Timeout stays at 10 minutes to cover long streaming turns, but the transport
+// is tuned: without MaxIdleConnsPerHost a rotation across several accounts
+// re-dials (and re-TLS-handshakes) on almost every request, and
+// ResponseHeaderTimeout turns a hung upstream into an error instead of a
+// request that occupies an account until the overall timeout fires.
+func newUpstreamHTTPClient() *http.Client {
+	return &http.Client{
+		Timeout: 600 * time.Second,
+		Transport: &http.Transport{
+			Proxy:                 http.ProxyFromEnvironment,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          64,
+			MaxIdleConnsPerHost:   16,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 60 * time.Second,
+			ExpectContinueTimeout: time.Second,
+		},
 	}
 }
 
@@ -223,7 +246,7 @@ func (c *CCClient) Send(ctx context.Context, req *ChatRequest) (*http.Response, 
 			break
 		}
 		lastAcct = acct
-		resp, err := c.doSend(ctx, body, acct.APIKey)
+		resp, err := c.doSend(ctx, body, acct.APIKey())
 		if err == nil {
 			acct.RecordSuccess()
 			return resp, acct, nil
@@ -233,7 +256,7 @@ func (c *CCClient) Send(ctx context.Context, req *ChatRequest) (*http.Response, 
 			return nil, acct, err
 		}
 		lastErr = err
-		log.Printf("[WARN] account %s request failed, failing over: %v", acct.Name, err)
+		log.Printf("[WARN] account %s request failed, failing over: %v", acct.Name(), err)
 	}
 	if lastErr != nil {
 		return nil, lastAcct, lastErr
@@ -499,7 +522,7 @@ func resolveModelName(model string) string {
 	}
 
 	// 在动态 catalog 中查找匹配的 ID（catalog 中的 ID 已含正确前缀）
-	for _, m := range modelCatalog {
+	for _, m := range modelSnapshot() {
 		if m.ID == model || strings.HasSuffix(m.ID, "/"+model) {
 			return m.ID
 		}
@@ -603,11 +626,20 @@ func messagesToCC(msgs []Message) ([]CCMsg, error) {
 	return out, nil
 }
 
+// roleToCC maps an OpenAI role onto the Command Code wire roles. Command Code
+// only understands user/assistant/tool (system and developer were hoisted to
+// the top-level system prompt), so anything else is folded into "user" — but
+// silently, a typo like "asistant" would degrade a whole conversation into
+// user turns, so unknown roles are logged.
 func roleToCC(role string) string {
 	switch role {
 	case "assistant", "tool":
 		return role
+	case "user", "system", "developer":
+		return "user"
 	default:
+		log.Printf("%s unknown message role %q mapped to \"user\"; the conversation may be misattributed",
+			colorize("[WARN]", ansiYellow), role)
 		return "user"
 	}
 }

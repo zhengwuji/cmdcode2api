@@ -365,7 +365,7 @@ func TestRefreshAccountKeepsSnapshotOnFailure(t *testing.T) {
 	if second.LastChecked == nil || !second.LastChecked.After(*first.LastChecked) {
 		t.Fatalf("last_checked not advanced: %+v", second.LastChecked)
 	}
-	if cached := usage.Quota(acct.ID); cached == nil || cached.LastError == "" {
+	if cached := usage.Quota(acct.ID()); cached == nil || cached.LastError == "" {
 		t.Fatalf("cached snapshot not updated: %+v", cached)
 	}
 }
@@ -392,8 +392,8 @@ func TestRefreshAllRefreshesEveryAccount(t *testing.T) {
 		t.Fatalf("RefreshAll returned %d, want 3", n)
 	}
 	for _, acct := range pool.List() {
-		if usage.Quota(acct.ID) == nil {
-			t.Fatalf("account %s missing snapshot", acct.Name)
+		if usage.Quota(acct.ID()) == nil {
+			t.Fatalf("account %s missing snapshot", acct.Name())
 		}
 	}
 }
@@ -437,7 +437,7 @@ func TestRefreshAccountCancelledContextDoesNotQuery(t *testing.T) {
 	if n != 0 {
 		t.Fatalf("upstream hit %d times on a cancelled context", n)
 	}
-	if usage.Quota(acct.ID) != nil {
+	if usage.Quota(acct.ID()) != nil {
 		t.Fatal("cancelled refresh stored a snapshot")
 	}
 
@@ -634,7 +634,7 @@ func TestAdminAccountListIncludesQuota(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	usage.SetQuota(acct.ID, &QuotaSnapshot{MonthlyCredits: floatPtr(9.5), LastChecked: timePtr(time.Now())})
+	usage.SetQuota(acct.ID(), &QuotaSnapshot{MonthlyCredits: floatPtr(9.5), LastChecked: timePtr(time.Now())})
 
 	_, payload := adminRequest(t, srv, "GET", "/admin/api/accounts", "admin-pass-123", nil)
 	list := payload["accounts"].([]any)
@@ -658,7 +658,7 @@ func TestAdminQuotaRefreshEndpoints(t *testing.T) {
 	}
 
 	// Single-account refresh returns the account row with a fresh snapshot.
-	resp, payload := adminRequest(t, srv, "POST", "/admin/api/accounts/"+acct.ID+"/quota/refresh", "admin-pass-123", nil)
+	resp, payload := adminRequest(t, srv, "POST", "/admin/api/accounts/"+acct.ID()+"/quota/refresh", "admin-pass-123", nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("single refresh status = %d: %v", resp.StatusCode, payload)
 	}
@@ -674,7 +674,7 @@ func TestAdminQuotaRefreshEndpoints(t *testing.T) {
 	}
 
 	// Refresh all returns immediately and runs in the background.
-	usage.SetQuota(acct.ID, &QuotaSnapshot{MonthlyCredits: floatPtr(0)})
+	usage.SetQuota(acct.ID(), &QuotaSnapshot{MonthlyCredits: floatPtr(0)})
 	resp, payload = adminRequest(t, srv, "POST", "/admin/api/quotas/refresh", "admin-pass-123", nil)
 	if resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("refresh all status = %d: %v", resp.StatusCode, payload)
@@ -682,11 +682,11 @@ func TestAdminQuotaRefreshEndpoints(t *testing.T) {
 	if payload["started"] != true || payload["accounts"] != float64(1) {
 		t.Fatalf("refresh all payload = %v", payload)
 	}
-	waitForQuotaCredits(t, usage, acct.ID, 12.5)
+	waitForQuotaCredits(t, usage, acct.ID(), 12.5)
 
 	// Refresh one via the body id.
 	resp, payload = adminRequest(t, srv, "POST", "/admin/api/quotas/refresh", "admin-pass-123",
-		map[string]any{"id": acct.ID})
+		map[string]any{"id": acct.ID()})
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("refresh by id status = %d: %v", resp.StatusCode, payload)
 	}
@@ -704,13 +704,13 @@ func TestAdminOverviewQuotaSummary(t *testing.T) {
 
 	older := time.Now().Add(-time.Hour)
 	newer := time.Now()
-	usage.SetQuota(acct1.ID, &QuotaSnapshot{
+	usage.SetQuota(acct1.ID(), &QuotaSnapshot{
 		MonthlyCredits: floatPtr(1),
 		BelowThreshold: true,
 		FiveHour:       &QuotaWindow{Used: 5, Cap: 5, Exceeded: true},
 		LastChecked:    timePtr(older),
 	})
-	usage.SetQuota(acct2.ID, &QuotaSnapshot{MonthlyCredits: floatPtr(50), LastChecked: timePtr(newer)})
+	usage.SetQuota(acct2.ID(), &QuotaSnapshot{MonthlyCredits: floatPtr(50), LastChecked: timePtr(newer)})
 
 	_, payload := adminRequest(t, srv, "GET", "/admin/api/overview", "admin-pass-123", nil)
 	summary, ok := payload["quotas"].(map[string]any)
@@ -753,7 +753,7 @@ func TestAdminAccountKeyChangeDropsQuota(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	oldID := acct.ID
+	oldID := acct.ID()
 	usage.SetQuota(oldID, &QuotaSnapshot{MonthlyCredits: floatPtr(4), LastChecked: timePtr(time.Now())})
 
 	resp, _ := adminRequest(t, srv, "PATCH", "/admin/api/accounts/"+oldID, "admin-pass-123",
@@ -780,13 +780,13 @@ func TestAdminAccountDeleteClearsQuota(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	usage.SetQuota(acct.ID, &QuotaSnapshot{MonthlyCredits: floatPtr(4), LastChecked: timePtr(time.Now())})
+	usage.SetQuota(acct.ID(), &QuotaSnapshot{MonthlyCredits: floatPtr(4), LastChecked: timePtr(time.Now())})
 
-	resp, _ := adminRequest(t, srv, "DELETE", "/admin/api/accounts/"+acct.ID, "admin-pass-123", nil)
+	resp, _ := adminRequest(t, srv, "DELETE", "/admin/api/accounts/"+acct.ID(), "admin-pass-123", nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("delete status = %d", resp.StatusCode)
 	}
-	if usage.Quota(acct.ID) != nil {
+	if usage.Quota(acct.ID()) != nil {
 		t.Fatal("quota not cleared with the account")
 	}
 }

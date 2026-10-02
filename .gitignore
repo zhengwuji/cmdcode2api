@@ -10,5 +10,8 @@ usage.json
 # prompts and user source. Never commit them.
 log.txt*
 *.log
+*.log.*
 *.patch
 changes_report.md
+*.pid
+coverage.out

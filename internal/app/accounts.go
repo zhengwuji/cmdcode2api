@@ -16,17 +16,33 @@ import (
 // defaultRateLimitCooldown is applied when a 429 carries no usable Retry-After.
 const defaultRateLimitCooldown = time.Minute
 
+// accountIdent is the immutable identity half of an Account: the derived ID and
+// the credential it was derived from. It is swapped as a whole through
+// Account.ident so readers on the request hot path never take a lock to learn
+// which account they are talking to or which key to present upstream.
+type accountIdent struct {
+	id     string
+	apiKey string
+}
+
 // Account is one upstream Command Code credential plus its ephemeral health
 // state. Durable request/token counters live in the UsageTracker keyed by ID;
 // everything here resets on restart.
+//
+// Locking contract:
+//   - ident (id/apiKey) is immutable once published; replacing the credential
+//     swaps the whole pointer with ident.Store, so ID()/APIKey() are lock-free.
+//   - mu guards the mutable display/health fields (name, enabled, lastError,
+//     rateLimitedUntil, authFailures) and is a RWMutex: the pool's hot path
+//     takes one RLock via eligible(), while the admin API takes the write lock.
+//   - AccountPool.mu is always acquired before Account.mu, never the reverse.
 type Account struct {
-	ID      string
-	Name    string
-	APIKey  string
-	Enabled bool
-	Errors  atomic.Int64
+	Errors atomic.Int64
 
-	mu               sync.Mutex
+	ident            atomic.Pointer[accountIdent]
+	mu               sync.RWMutex
+	name             string
+	enabled          bool
 	lastError        string
 	lastErrorAt      time.Time
 	lastUsedAt       time.Time
@@ -35,26 +51,82 @@ type Account struct {
 }
 
 func newAccount(name, apiKey string, enabled bool) *Account {
-	return &Account{ID: accountID(apiKey), Name: name, APIKey: apiKey, Enabled: enabled}
+	a := &Account{name: name, enabled: enabled}
+	a.ident.Store(&accountIdent{id: accountID(apiKey), apiKey: apiKey})
+	return a
 }
 
 // accountID derives a stable identifier from the key so stats survive renames
 // and the raw key never has to appear in persisted data or URLs.
 func accountID(apiKey string) string {
 	sum := sha256.Sum256([]byte(apiKey))
-	return "a" + hex.EncodeToString(sum[:4])
+	return "a" + hex.EncodeToString(sum[:8])
 }
 
-func (a *Account) MaskedKey() string {
-	if len(a.APIKey) > 12 {
-		return a.APIKey[:6] + "…" + a.APIKey[len(a.APIKey)-4:]
+// maskedKey hides most of a credential: prefix plus the last four characters.
+// Shared by upstream accounts and local client keys.
+func maskedKey(key string) string {
+	if len(key) > 12 {
+		return key[:6] + "…" + key[len(key)-4:]
 	}
-	return strings.Repeat("*", len(a.APIKey))
+	return strings.Repeat("*", len(key))
+}
+
+// ID returns the account's stable identifier. Lock-free: the identity is
+// published once and only ever replaced wholesale by SetKey.
+func (a *Account) ID() string {
+	return a.ident.Load().id
+}
+
+// APIKey returns the credential currently associated with the account.
+func (a *Account) APIKey() string {
+	return a.ident.Load().apiKey
+}
+
+// setIdentity atomically replaces the credential and its derived ID. Callers
+// hold the pool write lock and must migrate usage counters themselves.
+func (a *Account) setIdentity(apiKey string) string {
+	id := accountID(apiKey)
+	a.ident.Store(&accountIdent{id: id, apiKey: apiKey})
+	return id
+}
+
+func (a *Account) Name() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.name
+}
+
+func (a *Account) IsEnabled() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.enabled
+}
+
+// eligible reports whether the account can serve a request right now, reading
+// enabled and rateLimitedUntil under a single shared lock. Acquire calls this
+// once per candidate instead of taking the write lock twice per account.
+func (a *Account) eligible(now time.Time) bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.enabled && !now.Before(a.rateLimitedUntil)
+}
+
+func (a *Account) setEnabled(enabled bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.enabled = enabled
+}
+
+func (a *Account) setName(name string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.name = name
 }
 
 func (a *Account) RateLimited(now time.Time) bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	a.mu.RLock()
+	defer a.mu.RUnlock()
 	return now.Before(a.rateLimitedUntil)
 }
 
@@ -115,14 +187,15 @@ type AccountView struct {
 
 func (a *Account) View() AccountView {
 	now := time.Now()
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	ident := a.ident.Load()
+	a.mu.RLock()
+	defer a.mu.RUnlock()
 
 	view := AccountView{
-		ID:           a.ID,
-		Name:         a.Name,
-		KeyMasked:    a.MaskedKey(),
-		Enabled:      a.Enabled,
+		ID:           ident.id,
+		Name:         a.name,
+		KeyMasked:    maskedKey(ident.apiKey),
+		Enabled:      a.enabled,
 		Errors:       a.Errors.Load(),
 		AuthFailures: a.authFailures,
 	}
@@ -141,7 +214,7 @@ func (a *Account) View() AccountView {
 		view.RateLimited = true
 	}
 	switch {
-	case !a.Enabled:
+	case !a.enabled:
 		view.Status = "disabled"
 	case now.Before(a.rateLimitedUntil):
 		view.Status = "rate_limited"
@@ -186,7 +259,7 @@ func (p *AccountPool) Acquire() *Account {
 	start := int((p.cursor.Add(1) - 1) % uint64(n))
 	for i := 0; i < n; i++ {
 		a := p.accounts[(start+i)%n]
-		if !a.Enabled || a.RateLimited(now) {
+		if !a.eligible(now) {
 			continue
 		}
 		return a
@@ -213,7 +286,7 @@ func (p *AccountPool) EnabledCount() int {
 	defer p.mu.RUnlock()
 	n := 0
 	for _, a := range p.accounts {
-		if a.Enabled {
+		if a.IsEnabled() {
 			n++
 		}
 	}
@@ -226,7 +299,7 @@ func (p *AccountPool) Primary() *Account {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	for _, a := range p.accounts {
-		if a.Enabled {
+		if a.IsEnabled() {
 			return a
 		}
 	}
@@ -240,7 +313,7 @@ func (p *AccountPool) Get(id string) *Account {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	for _, a := range p.accounts {
-		if a.ID == id {
+		if a.ID() == id {
 			return a
 		}
 	}
@@ -268,7 +341,7 @@ func (p *AccountPool) Remove(id string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for i, a := range p.accounts {
-		if a.ID == id {
+		if a.ID() == id {
 			p.accounts = append(p.accounts[:i], p.accounts[i+1:]...)
 			return true
 		}
@@ -276,22 +349,31 @@ func (p *AccountPool) Remove(id string) bool {
 	return false
 }
 
+// SetEnabled and Rename hold the pool write lock while touching the account,
+// matching SetKey's pool.mu -> account.mu order so a concurrent Acquire/View
+// can never observe a half-updated account.
 func (p *AccountPool) SetEnabled(id string, enabled bool) bool {
-	a := p.Get(id)
-	if a == nil {
-		return false
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, a := range p.accounts {
+		if a.ID() == id {
+			a.setEnabled(enabled)
+			return true
+		}
 	}
-	a.Enabled = enabled
-	return true
+	return false
 }
 
 func (p *AccountPool) Rename(id, name string) bool {
-	a := p.Get(id)
-	if a == nil {
-		return false
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, a := range p.accounts {
+		if a.ID() == id {
+			a.setName(name)
+			return true
+		}
 	}
-	a.Name = name
-	return true
+	return false
 }
 
 // SetKey replaces an account's credential. Because IDs derive from the key,
@@ -308,7 +390,7 @@ func (p *AccountPool) SetKey(id, newKey string) (string, error) {
 	defer p.mu.Unlock()
 	var a *Account
 	for _, cand := range p.accounts {
-		if cand.ID == id {
+		if cand.ID() == id {
 			a = cand
 			break
 		}
@@ -317,14 +399,11 @@ func (p *AccountPool) SetKey(id, newKey string) (string, error) {
 		return "", fmt.Errorf("account not found")
 	}
 	for _, other := range p.accounts {
-		if other != a && other.ID == newID {
+		if other != a && other.ID() == newID {
 			return "", errDuplicateAccount
 		}
 	}
-	a.mu.Lock()
-	a.APIKey = newKey
-	a.ID = newID
-	a.mu.Unlock()
+	a.setIdentity(newKey)
 	return newID, nil
 }
 
@@ -336,12 +415,12 @@ func (p *AccountPool) EarliestRateLimitWait(now time.Time) time.Duration {
 	defer p.mu.RUnlock()
 	var earliest time.Time
 	for _, a := range p.accounts {
-		if !a.Enabled {
+		if !a.IsEnabled() {
 			continue
 		}
-		a.mu.Lock()
+		a.mu.RLock()
 		until := a.rateLimitedUntil
-		a.mu.Unlock()
+		a.mu.RUnlock()
 		if until.After(now) && (earliest.IsZero() || until.Before(earliest)) {
 			earliest = until
 		}
@@ -369,7 +448,7 @@ func (p *AccountPool) Stats() (total, enabled, rateLimited int) {
 	defer p.mu.RUnlock()
 	total = len(p.accounts)
 	for _, a := range p.accounts {
-		if a.Enabled {
+		if a.IsEnabled() {
 			enabled++
 			if a.RateLimited(now) {
 				rateLimited++
@@ -385,10 +464,10 @@ func (p *AccountPool) Config() []AccountConfig {
 	defer p.mu.RUnlock()
 	list := make([]AccountConfig, 0, len(p.accounts))
 	for _, a := range p.accounts {
-		enabled := a.Enabled
+		enabled := a.IsEnabled()
 		list = append(list, AccountConfig{
-			Name:    a.Name,
-			APIKey:  a.APIKey,
+			Name:    a.Name(),
+			APIKey:  a.APIKey(),
 			Enabled: &enabled,
 		})
 	}
@@ -399,8 +478,5 @@ func (p *AccountPool) Config() []AccountConfig {
 // persists it. The legacy single-key field is cleared whenever accounts exist
 // so a deleted account cannot resurrect from the stale field.
 func (p *AccountPool) SyncToConfig(cfg *Config) {
-	cfg.CommandCode.Accounts = p.Config()
-	if len(cfg.CommandCode.Accounts) > 0 {
-		cfg.CommandCode.APIKey = ""
-	}
+	cfg.SetAccountsSnapshot(p.Config())
 }

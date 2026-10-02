@@ -6,6 +6,11 @@ on:
     tags: ["v*"]
   pull_request:
 
+env:
+  # The module targets go 1.25 (see go.mod); CI installs exactly that release
+  # from the go directive so vet/test/build all run on one toolchain.
+  GOTOOLCHAIN: local
+
 jobs:
   test:
     name: Vet & Test
@@ -20,8 +25,47 @@ jobs:
       - name: go vet
         run: go vet ./...
 
-      - name: go test
-        run: go test -race -count=1 ./...
+      - name: go test (race + coverage)
+        run: go test -race -count=1 -coverprofile=coverage.out -covermode=atomic ./...
+
+      - name: Coverage summary
+        run: go tool cover -func=coverage.out | tail -1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+          retention-days: 7
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: golangci-lint-action@v6
+        with:
+          version: latest
+          args: --timeout=5m
+
+  bench:
+    name: Benchmark
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # Benchmarks cover the hot paths: account selection, the usage
+      # tracker's per-request record, and the SSE event normalizer.
+      - name: go test -bench
+        run: go test -run '^$' -bench . -benchmem ./internal/app/...
 
   build:
     name: Build
@@ -41,7 +85,10 @@ jobs:
           CGO_ENABLED: "0"
           GOOS: linux
           GOARCH: amd64
-        run: go build -trimpath -o cmdcode2api-linux-amd64 ./cmd/cmdcode2api
+        run: |
+          go build -trimpath \
+            -ldflags "-s -w -X cmdcode2api/internal/app.Version=${GITHUB_REF_NAME}" \
+            -o cmdcode2api-linux-amd64 ./cmd/cmdcode2api
 
       - uses: actions/upload-artifact@v4
         with:
@@ -88,6 +135,8 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
+          build-args: |
+            VERSION=${{ github.ref_name }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha

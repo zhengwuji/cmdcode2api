@@ -72,7 +72,7 @@ func TestAdminModelsKeepsNonCatalogPrefixes(t *testing.T) {
 func TestAdminAccountPatchKeyMovesUsage(t *testing.T) {
 	srv, pool, _, _, usage, _ := newAdminTestEnv(t)
 	acct, _ := pool.Add("main", "cc-old-key", true)
-	oldID := acct.ID
+	oldID := acct.ID()
 	usage.Recorder(oldID, "").Record(9, 8, 0, 0)
 
 	resp, payload := adminRequest(t, srv, "PATCH", "/admin/api/accounts/"+oldID, "admin-pass-123",

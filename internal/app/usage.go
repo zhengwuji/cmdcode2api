@@ -1,10 +1,13 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
+	"log"
 	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // usageRecorder is what the stream handlers consume so they can record usage
@@ -20,6 +23,11 @@ type UsageTracker struct {
 	CacheReadTokens  atomic.Int64 `json:"cache_read_tokens"`
 	CacheWriteTokens atomic.Int64 `json:"cache_write_tokens"`
 	saveMu           sync.Mutex
+
+	// Persistence is debounced: mutating paths call markDirty, and
+	// RunPersistence coalesces every change inside one flush interval into a
+	// single write. Flush forces a write on shutdown.
+	dirty atomic.Bool
 
 	// Both counter maps are guarded by accMu. Account and client-key
 	// counters are independent dimensions: an account aggregates across all
@@ -80,6 +88,7 @@ func (u *UsageTracker) Record(prompt, completion, cacheRead, cacheWrite int) {
 	if cacheWrite > 0 {
 		u.CacheWriteTokens.Add(int64(cacheWrite))
 	}
+	u.markDirty()
 }
 
 // ForAccount returns a recorder that mirrors usage into the per-account
@@ -88,7 +97,7 @@ func (u *UsageTracker) ForAccount(a *Account) usageRecorder {
 	if a == nil {
 		return u
 	}
-	return u.Recorder(a.ID, "")
+	return u.Recorder(a.ID(), "")
 }
 
 // RecorderFor is a nil-safe Recorder wrapper taking the served account.
@@ -96,7 +105,7 @@ func (u *UsageTracker) RecorderFor(a *Account, clientKeyID string) usageRecorder
 	if a == nil {
 		return u.Recorder("", clientKeyID)
 	}
-	return u.Recorder(a.ID, clientKeyID)
+	return u.Recorder(a.ID(), clientKeyID)
 }
 
 // Recorder returns a recorder that mirrors usage into the per-account and
@@ -193,9 +202,10 @@ func (u *UsageTracker) ClientKeyUsage(id string) UsageSnapshotEntry {
 // stop persisting.
 func (u *UsageTracker) DropAccount(id string) {
 	u.accMu.Lock()
-	defer u.accMu.Unlock()
 	delete(u.accounts, id)
 	delete(u.quotas, id)
+	u.accMu.Unlock()
+	u.markDirty()
 }
 
 // Quota returns the cached quota snapshot for an account, or nil. Stored
@@ -212,17 +222,19 @@ func (u *UsageTracker) SetQuota(id string, snap *QuotaSnapshot) {
 		return
 	}
 	u.accMu.Lock()
-	defer u.accMu.Unlock()
 	u.ensureMapsLocked()
 	u.quotas[id] = snap
+	u.accMu.Unlock()
+	u.markDirty()
 }
 
 // DropQuota forgets an account's quota snapshot, used when its key changes
 // because the snapshot belongs to the old credential.
 func (u *UsageTracker) DropQuota(id string) {
 	u.accMu.Lock()
-	defer u.accMu.Unlock()
 	delete(u.quotas, id)
+	u.accMu.Unlock()
+	u.markDirty()
 }
 
 // quotaSnapshot copies the quota map for persistence.
@@ -246,30 +258,33 @@ func (u *UsageTracker) MoveAccount(oldID, newID string) {
 		return
 	}
 	u.accMu.Lock()
-	defer u.accMu.Unlock()
 	u.ensureMapsLocked()
 	old := u.accounts[oldID]
 	if old == nil {
+		u.accMu.Unlock()
 		return
 	}
 	delete(u.accounts, oldID)
 	target := u.accounts[newID]
 	if target == nil {
 		u.accounts[newID] = old
-		return
+	} else {
+		target.Requests.Add(old.Requests.Load())
+		target.PromptTokens.Add(old.PromptTokens.Load())
+		target.CompletionTokens.Add(old.CompletionTokens.Load())
+		target.CacheReadTokens.Add(old.CacheReadTokens.Load())
+		target.CacheWriteTokens.Add(old.CacheWriteTokens.Load())
 	}
-	target.Requests.Add(old.Requests.Load())
-	target.PromptTokens.Add(old.PromptTokens.Load())
-	target.CompletionTokens.Add(old.CompletionTokens.Load())
-	target.CacheReadTokens.Add(old.CacheReadTokens.Load())
-	target.CacheWriteTokens.Add(old.CacheWriteTokens.Load())
+	u.accMu.Unlock()
+	u.markDirty()
 }
 
 // DropClientKey forgets a removed client key's counters.
 func (u *UsageTracker) DropClientKey(id string) {
 	u.accMu.Lock()
-	defer u.accMu.Unlock()
 	delete(u.clientKeys, id)
+	u.accMu.Unlock()
+	u.markDirty()
 }
 
 func (u *UsageTracker) Snapshot() UsageSnapshot {
@@ -334,6 +349,65 @@ func (s UsageSnapshot) TotalTokens() int64 {
 // usageFile is a var so tests can redirect persistence to a temp dir.
 var usageFile = "usage.json"
 
+// usageFlushInterval bounds how long a usage mutation may stay unpersisted.
+// The write path used to run synchronously on every chat request and on every
+// quota refresh; coalescing them keeps a busy gateway from rewriting the whole
+// file (and burning fsyncs) once per request.
+const usageFlushInterval = time.Second
+
+// markDirty records that the tracker has unsaved changes. It never blocks the
+// request path.
+func (u *UsageTracker) markDirty() {
+	u.dirty.Store(true)
+}
+
+// RunPersistence flushes dirty state at most once per usageFlushInterval until
+// ctx is cancelled, then flushes once more. Callers should still call Flush
+// explicitly on shutdown so the final state cannot be lost.
+func (u *UsageTracker) RunPersistence(ctx context.Context) {
+	ticker := time.NewTicker(usageFlushInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			u.flushIfDirty()
+		}
+	}
+}
+
+func (u *UsageTracker) flushIfDirty() {
+	if !u.dirty.Load() {
+		return
+	}
+	if err := u.Flush(); err != nil {
+		log.Printf("[WARN] save usage failed: %v", err)
+	}
+}
+
+// Flush writes the current snapshot to disk if anything changed since the last
+// successful write. It is safe to call concurrently.
+func (u *UsageTracker) Flush() error {
+	if !u.dirty.Swap(false) {
+		return nil
+	}
+	if err := u.save(); err != nil {
+		// Keep the flag set so the next flush retries instead of silently
+		// dropping the update.
+		u.dirty.Store(true)
+		return err
+	}
+	return nil
+}
+
+// Save is the unconditional write used by tests and callers that need the file
+// to exist right now.
+func (u *UsageTracker) Save() error {
+	u.dirty.Store(false)
+	return u.save()
+}
+
 func loadUsage() *UsageTracker {
 	u := &UsageTracker{}
 	data, err := os.ReadFile(usageFile)
@@ -341,7 +415,15 @@ func loadUsage() *UsageTracker {
 		return u
 	}
 	var snap persistedUsage
-	if json.Unmarshal(data, &snap) != nil {
+	if err := json.Unmarshal(data, &snap); err != nil {
+		// Never start from a clean slate on top of a corrupt file: keep a copy
+		// so the operator can recover the history by hand.
+		backup := usageFile + ".bak"
+		if renameErr := os.Rename(usageFile, backup); renameErr != nil {
+			log.Printf("[WARN] usage file is corrupt (%v) and could not be backed up: %v", err, renameErr)
+		} else {
+			log.Printf("[WARN] usage file is corrupt (%v); moved it to %s and starting fresh", err, backup)
+		}
 		return u
 	}
 	u.TotalRequests.Store(snap.TotalRequests)
@@ -374,12 +456,16 @@ func (u *UsageTracker) save() error {
 	defer u.saveMu.Unlock()
 
 	snap := persistedUsage{UsageSnapshot: u.Snapshot(), Quotas: u.quotaSnapshot()}
-	data, err := json.MarshalIndent(snap, "", "  ")
+	// Compact, not indented: this file is machine state, and pretty-printing
+	// it roughly doubles the bytes written on every flush.
+	data, err := json.Marshal(snap)
 	if err != nil {
 		return err
 	}
 	tmp := usageFile + ".tmp"
-	if err := os.WriteFile(tmp, data, 0644); err != nil {
+	// 0600: the file carries per-account and per-client-key usage, which is
+	// operator data rather than world-readable state.
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
 		return err
 	}
 	return os.Rename(tmp, usageFile)

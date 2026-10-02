@@ -1,30 +1,89 @@
 # cmdcode2api
 
-[中文说明](README.zh-CN.md)
+[English](README.en.md)
 
-`cmdcode2api` is a small OpenAI-compatible gateway for [Command Code](https://commandcode.ai/). OpenAI-style clients call the familiar `/v1/chat/completions` and `/v1/models` endpoints, and the gateway forwards requests to Command Code — rotating across multiple accounts, tracking usage, and serving a built-in admin WebUI.
+`cmdcode2api` 是一个 OpenAI 兼容的小型网关，面向 [Command Code](https://commandcode.ai/)。OpenAI 风格的客户端调用熟悉的 `/v1/chat/completions` 与 `/v1/models`，由网关转发到 Command Code——在多个账号间轮换、统计用量，并内置管理 WebUI。
 
-## Features
+## 更新内容
 
-- OpenAI-compatible `POST /v1/chat/completions` (streaming and non-streaming) and `GET /v1/models`
-- Multiple Command Code accounts with round-robin rotation and automatic failover (`401`/`403`/`429`/5xx), including per-account 429 cooldown
-- Multiple local client API keys with per-key request and token accounting
-- Command Code quota dashboard: 5-hour / weekly / estimated monthly progress bars, credit balances, plan and billing period, refreshed in the background every 5 minutes
-- Embedded single-file WebUI: usage dashboard, account/key management, model exposure editor, live settings, and log tail
-- Browser OAuth helper for obtaining a Command Code API key (CLI or WebUI); each OAuth run adds an account
-- Local bearer-token auth for clients, separate admin password for the WebUI
-- Usage counters (global, per-account, per-client-key) and cached quota snapshots persisted to `usage.json`
-- Base64 `image_url` conversion to Command Code image blocks; CORS enabled for local UI clients
-- `GET /health` and `GET /usage` endpoints
+### v0.3.0
 
-## Quick start
+本次更新集中在并发性能、持久化可靠性、安全性、协议兼容性与 Windows 运维脚本。
+
+**并发与性能**
+
+- 账号与客户端密钥的身份字段（ID / API Key）改为不可变快照 + 原子指针，读路径完全无锁；可变字段改用读写锁
+- 热路径 `Acquire()` 由「每个候选账号 2 次写锁」降为 1 次读锁
+- 基准测试：`BenchmarkAccountPoolAcquire` 在 1 / 4 / 16 个账号下均为约 34 ns/op、0 次内存分配，耗时**不随账号池规模增长**
+
+**持久化**
+
+- `usage.json` 改为去抖写入：请求路径只置脏标记，后台每秒合并落盘一次，进程退出时兜底 `Flush`
+- 文件权限收紧为 `0600`，改用紧凑 JSON，写入走临时文件 + `rename`
+- 文件损坏不再静默清空，而是备份为 `usage.json.bak` 并输出告警
+- `config.yaml` 同样改为临时文件 + `rename`，避免崩溃留下截断的配置
+
+**安全**
+
+- `/usage` 改为需要 Bearer 鉴权（快照包含每个账号与每把密钥的用量画像）
+- CORS 收敛到仅 `/v1/*`，不再给 `/admin/*` 等路径下发 `Access-Control-Allow-Origin: *`
+- 账号 ID / 密钥 ID 的摘要长度由 4 字节加长为 8 字节，消除 32 位生日碰撞风险
+- 客户端密钥认证失败新增限流（默认 20 次 / 5 分钟 → 锁定 10 分钟，返回 `429` 与 `Retry-After`）
+- 限流表淘汰由 O(n) 线性扫描改为 O(1)
+
+**HTTP 与可用性**
+
+- `ReadTimeout` 改为 `ReadHeaderTimeout: 10s`，大体积 base64 图片在慢链路上不再必然超时
+- SSE 流式响应逐块续期写超时，长回答不再被 600 秒硬砍
+- 上游 HTTP 连接池调优（连接复用、HTTP/2、响应头超时）
+- 模型目录改为后台刷新，不再阻塞启动
+- 内嵌 WebUI 支持 ETag + gzip，命中缓存后返回 `304`、零传输
+
+**协议兼容性**
+
+- 被静默丢弃的 OpenAI 参数（`temperature` / `top_p` / `stop` / `seed` / `response_format` 等）现在会在 `--debug` 下告警，文档提供完整对照表
+- `max_tokens` 超过上游上限时会返回 `x-cmdcode2api-max-tokens-clamped` 响应头
+- 出现未知 `role` 时告警，不再静默降级
+- 额度估算优先采用上游返回的实时数据，硬编码套餐表仅作兜底
+
+**构建、部署与运维**
+
+- 版本号支持 `-ldflags -X` 注入，Docker 构建可用 `--build-arg VERSION=`
+- Docker 镜像改为非 root 运行，并内置 `HEALTHCHECK`
+- 新增 Go 基准测试与覆盖率报告；CI 增加 golangci-lint 与 benchmark 任务
+- Windows 新增一整套管理脚本：`start` / `start-console` / `stop` / `restart` / `status` / `menu` / `oauth`
+- `start.ps1` 在源码比 `cmdcode2api.exe` 更新时自动重新编译；若旧进程仍在运行，会先停止再启动，确保改动真正生效
+- 修复 `start.ps1` 因缺少 UTF-8 BOM 导致 Windows PowerShell 5.1 解析失败（报「数组索引表达式缺失或无效」）
+- 修复 `status.ps1` 使用 `localhost` 探测时先尝试 IPv6、导致误报「端口暂未响应」
+- 日志超过 10 MB 自动滚动为 `cmdcode2api.log.1`
+
+**文档**
+
+- README 改为中文为主，英文版见 [README.en.md](README.en.md)
+
+## 功能
+
+- OpenAI 兼容的 `POST /v1/chat/completions`（流式与非流式）与 `GET /v1/models`
+- 多 Command Code 账号轮询使用，`401`/`403`/`429`/5xx 自动故障转移，含账号级 429 冷却
+- 多客户端密钥，每把密钥独立统计请求与 token 用量
+- Command Code 额度仪表盘：5 小时 / 本周 / 按月估算进度条、余额、套餐与账期，后台每 5 分钟刷新
+- 内嵌单文件 WebUI：用量总览、账号/密钥管理、模型开放编辑器、在线设置、日志查看
+- 浏览器 OAuth 助手获取 Command Code API Key（CLI 或 WebUI），每次授权添加一个账号
+- 客户端 Bearer Token 鉴权，WebUI 使用独立管理密码
+- 用量计数（全局、按账号、按密钥）与额度快照持久化在 `usage.json`
+- base64 `image_url` 转 Command Code 图片块；`/v1/*` 为本地 UI 客户端开启 CORS
+- `GET /health`（免鉴权）与 `GET /usage`（需 Bearer）端点
+
+## 快速开始
 
 ```bash
 go build -o cmdcode2api ./cmd/cmdcode2api
 ./cmdcode2api
 ```
 
-The first start writes `config.yaml` in the working directory and prints the generated client key and WebUI admin password once. Add a Command Code account (next section), then point any OpenAI client at the gateway:
+常用 Make 目标：`make build`（带 `-ldflags` 写入版本号，可用 `make build VERSION=v1.2.3` 覆盖）、`make check`（`go vet` + `go test -count=1`）、`make cover`（生成覆盖率报告）、`make build-linux`（静态交叉编译）。`go test -race` 需要 cgo，本机没有 C 工具链时交给 CI 跑。
+
+首次启动会在工作目录生成 `config.yaml`，并把自动生成的客户端密钥与 WebUI 管理密码打印一次。添加一个 Command Code 账号（见下节），然后把任意 OpenAI 客户端指向网关：
 
 ```bash
 curl http://localhost:11434/v1/chat/completions \
@@ -39,32 +98,32 @@ curl http://localhost:11434/v1/chat/completions \
   }'
 ```
 
-The server starts fine with zero accounts — the WebUI, client keys, and settings all work, and chat requests return `503 no_accounts` until one is added. Adding the first account from the WebUI fetches the model catalog immediately.
+没有任何账号时服务也会照常启动——WebUI、客户端密钥、设置均可用，chat 请求返回 `503 no_accounts`，直到添加账号为止；从 WebUI 添加首个账号时会立即拉取模型目录。
 
 ## Docker
 
-Prebuilt multi-arch images are published to GHCR by CI on every master push (`latest`) and every `v*` tag. `config.yaml` and `usage.json` live in the `/data` volume:
+CI 会在每次 master 推送（`latest` 标签）和 `v*` 标签时自动发布多架构镜像到 GHCR。`config.yaml` 和 `usage.json` 放在 `/data` 数据卷中：
 
 ```bash
 docker run -d --name cmdcode2api -p 11434:11434 -v cmdcode2api-data:/data ghcr.io/peach0x33a/cmdcode2api:latest
 ```
 
-A ready-to-copy Compose file is provided as `docker-compose.example.yml`:
+开箱即用的 Compose 文件见 `docker-compose.example.yml`：
 
 ```bash
 cp docker-compose.example.yml docker-compose.yml
 docker compose up -d
 ```
 
-With an empty data directory the first start generates `config.yaml`, prints the client key and admin password once (`docker compose logs`), and then serves. To build the image locally, use `docker build -t cmdcode2api .` — networks that cannot reach proxy.golang.org can pass `--build-arg GOPROXY=https://goproxy.cn,direct`.
+数据目录为空时，首次启动会生成 `config.yaml`，客户端密钥和管理密码打印一次（`docker compose logs` 查看），随后进入服务状态。容器以非 root 用户 `cmdcode2api` 运行，并带 `HEALTHCHECK` 探测 `/health`；版本号通过 `--build-arg VERSION=...` 写入二进制。本地构建用 `docker build -t cmdcode2api .`；无法访问 proxy.golang.org 的网络可加 `--build-arg GOPROXY=https://goproxy.cn,direct`。
 
-## Adding Command Code accounts
+## 添加 Command Code 账号
 
-### WebUI (simplest)
+### WebUI（最简单）
 
-Open `/webui`, go to the **Accounts** tab, and paste a Command Code API key. This works regardless of container networking or SSH access.
+打开 `/webui`，在「账号」页粘贴 Command Code API Key，不受容器网络或 SSH 访问限制。
 
-The Accounts tab can also run the OAuth flow. It uses the server's local `127.0.0.1:5959-5968` callback ports, which works out of the box when the browser runs on the same machine. When it does not — remote or containerized deployments, or a browser that cannot reach that port — the Command Code page cannot hand the credential back automatically. In that case the page stops on a URL carrying the credential in its query string (`?apiKey=…&state=…`); paste that whole address-bar link into the **回调链接** field and submit it. The gateway parses the credential out of the link locally (it never fetches the URL), and the single-use state token still has to match the pending flow, so a forged link cannot inject an account.
+「账号」页也可以发起 OAuth。默认使用服务器本地的 `127.0.0.1:5959-5968` 回调端口，浏览器与服务器同机时开箱即用。当浏览器访问不到该端口时（远程 / 容器部署），Command Code 页面无法自动把凭据交回来，此时页面会停在一个把凭据放在查询参数里的地址（`?apiKey=…&state=…`）：把地址栏里这条完整链接粘贴到**回调链接**输入框并提交即可。网关只在本地解析这条链接（不会抓取该 URL），且一次性 state token 仍需与进行中的授权匹配，因此伪造链接无法注入账号。
 
 ### CLI OAuth
 
@@ -72,54 +131,54 @@ The Accounts tab can also run the OAuth flow. It uses the server's local `127.0.
 ./cmdcode2api --oauth
 ```
 
-The OAuth callback server always binds to `127.0.0.1:5959-5968` on the machine running the binary. Each successful flow appends one account to `config.yaml`; run `--oauth` again (e.g. with a different browser profile) to add more accounts, and re-authorizing an existing key is a no-op.
+OAuth 回调服务器始终只绑定运行程序那台机器的 `127.0.0.1:5959-5968`。每次授权成功会向 `config.yaml` 追加一个账号；重复执行 `--oauth`（例如换一个浏览器账号）可以继续添加账号，对已存在的 Key 重复授权不会产生重复账号。
 
-**Browser on the same machine** — open the printed authorization URL directly.
+**浏览器在同一台机器** —— 直接打开命令打印的授权链接。
 
-**Browser on a different machine** — forward a callback port over SSH and pass an explicit callback URL:
+**浏览器在另一台机器** —— 先用 SSH 把回调端口转发到本地，再显式指定回调地址：
 
 ```bash
-# local machine
+# 本地机器
 ssh -L 5959:127.0.0.1:5959 user@server
 
-# server
+# 服务器
 ./cmdcode2api --oauth --oauth-callback http://localhost:5959/callback
 ```
 
-### Inside a container
+### 容器内 OAuth
 
-The callback server listens on `127.0.0.1:5959-5968` *inside the container*, so the browser must be able to reach that port in the container's network namespace:
+回调服务器监听的是**容器内**的 `127.0.0.1:5959-5968`，因此浏览器必须能访问到容器网络命名空间里的这个端口：
 
 ```bash
-# browser on the same machine: share the host network
+# 浏览器和 Docker 在同一台机器：共享宿主机网络
 docker compose run --rm --network host cmdcode2api --oauth
 
-# browser on a different machine: forward the port over SSH first
+# 浏览器在另一台机器：先用 SSH 转发端口
 ssh -L 5959:127.0.0.1:5959 user@server
 docker compose run --rm --network host cmdcode2api --oauth \
   --oauth-callback http://localhost:5959/callback
 
-# without Compose
+# 不用 Compose 时
 docker run --rm -it --network host -v cmdcode2api-data:/data \
   ghcr.io/peach0x33a/cmdcode2api:latest --oauth
 ```
 
-After authorizing, the account is appended to `/data/config.yaml` automatically; run `docker compose up -d` afterwards if the gateway is still stopped.
+授权完成后账号会自动追加到 `/data/config.yaml`；如果网关还没启动，再 `docker compose up -d` 即可。
 
-## Command-line flags
+## 命令行旗标
 
-| Flag | Meaning |
+| 旗标 | 说明 |
 | --- | --- |
-| `--oauth` | Run the browser OAuth flow to obtain a Command Code API key |
-| `--oauth-callback URL` | Explicit callback URL for `--oauth`, e.g. `http://localhost:5959/callback` |
-| `--host HOST` | HTTP listen host override, e.g. `0.0.0.0` |
-| `--port PORT` | HTTP listen port override |
-| `--debug` | Print request bodies and all upstream SSE events to stderr |
-| `--version` | Print the version and Go runtime version, then exit |
+| `--oauth` | 通过浏览器 OAuth 获取 Command Code API Key |
+| `--oauth-callback URL` | `--oauth` 的显式回调地址，例如 `http://localhost:5959/callback` |
+| `--host HOST` | 覆盖 HTTP 监听地址，例如 `0.0.0.0` |
+| `--port PORT` | 覆盖 HTTP 监听端口 |
+| `--debug` | 向 stderr 打印请求体与全部上游 SSE 事件 |
+| `--version` | 打印版本与 Go 运行时版本后退出 |
 
-## Configuration
+## 配置
 
-`config.yaml` lives in the working directory, is created automatically, and is ignored by git. Example shape:
+`config.yaml` 位于程序运行目录，自动生成且被 git 忽略。示例：
 
 ```yaml
 api_key: ccgw-generated-local-client-key
@@ -128,7 +187,7 @@ api_keys:
     key: ccgw-generated-local-client-key
   - name: my-agent
     key: ccgw-another-client-key
-admin_password: kR7vBn2xQm9T
+admin_password: change-me-please
 webui: true
 commandcode:
   base_url: https://api.commandcode.ai
@@ -146,108 +205,108 @@ exclude_models:
   - gemini-
 ```
 
-Fields:
+字段说明：
 
-- `api_key` — legacy single local client key. Migrated into `api_keys` on load and cleared on save once the list is non-empty.
-- `api_keys` — local bearer keys that clients use to call this gateway. Requests and token usage are tracked per key. Manage them in the WebUI; changes apply immediately and persist here.
-- `admin_password` — password for the WebUI admin API. Generated on first start when empty and printed once.
-- `webui` — set to `false` to disable serving the embedded WebUI and admin API entirely.
-- `commandcode.accounts` — list of Command Code credentials. Requests rotate across enabled accounts (see below). The legacy single-key field `commandcode.api_key` is still accepted and migrated to a one-entry list on load.
-- `commandcode.base_url` — Command Code API base URL.
-- `host` — HTTP listen host. Defaults to `localhost`; use `0.0.0.0` to listen on all interfaces.
-- `port` — HTTP listen port. Defaults to `11434`.
-- `exclude_models` — model ID prefixes hidden from `/v1/models` and rejected by `/v1/chat/completions`. Maintained from the WebUI's Models tab, where the upstream catalog is shown with checkboxes.
+- `api_key`：旧版单客户端密钥字段；加载时自动迁移进 `api_keys`，列表非空后保存时清除。
+- `api_keys`：调用本网关的客户端密钥列表，每把密钥独立统计请求与 token 用量。可在 WebUI 中管理，改动即时生效并写回本文件。
+- `admin_password`：WebUI 管理 API 的密码；为空时首次启动自动生成并打印一次。
+- `webui`：设为 `false` 可完全不托管内嵌 WebUI 与管理 API。
+- `commandcode.accounts`：Command Code 账号列表，请求在其间轮换（见下）。旧的 `commandcode.api_key` 单 Key 写法仍然识别，加载时自动迁移为单账号列表。
+- `commandcode.base_url`：Command Code API 地址。
+- `host`：HTTP 监听地址，默认 `localhost`；对外监听设置为 `0.0.0.0`。
+- `port`：HTTP 监听端口，默认 `11434`。
+- `exclude_models`：从 `/v1/models` 隐藏、并在 `/v1/chat/completions` 中拒绝调用的模型 ID 前缀。在 WebUI「模型」页以复选框方式维护。
 
-New configs exclude `gpt-`, `claude-`, and `gemini-` by default. These prefixes match both plain model IDs such as `gpt-4` and provider-qualified IDs such as `openai/gpt-4` by checking the part after the final `/`. To make all models available, remove the entries or set `exclude_models: []`.
+新生成的配置默认排除 `gpt-`、`claude-`、`gemini-` 前缀。匹配时会同时支持普通模型 ID（例如 `gpt-4`）和带 provider 的 ID（例如 `openai/gpt-4`，会匹配最后一个 `/` 后面的 `gpt-4`）。需要开放所有模型时，删除这些条目或设置 `exclude_models: []`。
 
-## Multi-account rotation
+## 多账号轮换
 
-Every chat request is sent with the next enabled account in round-robin order. When an account fails with `401`, `403`, `429`, or a 5xx, the request is retried with the next account automatically:
+每次 chat 请求按轮询方式使用下一个启用的账号。账号返回 `401`、`403`、`429` 或 5xx 时自动换下一个账号重试：
 
-- A `429` puts the account into cooldown for the upstream `Retry-After` duration (60 seconds by default); cooldown accounts are skipped until they recover. If every enabled account is cooling down, the client receives `429 rate_limit_error` with the earliest recovery time.
-- `400`/`422` (bad request) and client-canceled contexts are not retried.
-- Failover happens before any bytes are sent to the client; once a stream has started it is never replayed on another account.
-- Per-account request/token counters persist in `usage.json`; error state, last error, and cooldown windows are runtime-only and visible in the WebUI.
+- `429`：按上游 `Retry-After` 冷却该账号（缺省 60 秒），冷却期内跳过；全部账号都在冷却时向客户端返回 `429 rate_limit_error` 和最早恢复时间。
+- `400` / `422`（请求本身有问题）与客户端主动取消不重试。
+- 故障转移只发生在向客户端写出任何字节之前；流式响应一旦开始不会在另一个账号上重放。
+- 每个账号的请求 / token 计数持久化在 `usage.json`；错误信息、冷却窗口等运行时状态可在 WebUI 中查看。
 
-## Client keys
+## 客户端密钥
 
-`api_keys` holds the bearer keys clients use to call this gateway; different clients can each use their own key:
+`api_keys` 是客户端调用本网关的 Bearer 密钥列表，不同客户端各用一把，互不影响：
 
-- Create keys in the WebUI's **Keys** tab — values are always server-generated (`ccgw-` prefix) and never accepted from input; keys can be enabled/disabled, copied, and deleted.
-- Each key gets independent request and token counters, persisted in `usage.json` under `client_keys` and visible at `/usage`.
-- Keys are masked in the list; reveal or copy them on demand — the full value is shown once at creation and available via the reveal endpoint.
-- The legacy single `api_key` field keeps working and migrates to one key named `default` on load.
+- 在 WebUI「密钥」页新建——密钥值一律由服务端生成（`ccgw-` 前缀），不接受外部指定；支持启用/禁用、复制、删除。
+- 每把密钥独立统计请求数与 token 用量，持久化在 `usage.json` 的 `client_keys` 字段，也在 `/usage` 中可见。
+- 列表中密钥默认打码，可按需显示/复制——完整值仅在创建时展示一次，之后可经 reveal 端点获取。
+- 旧的单一 `api_key` 字段继续有效，加载时自动迁移为名为 `default` 的一把密钥。
 
 ## WebUI
 
-With `webui` enabled (the default), the binary serves an embedded single-file admin interface under `/webui` (the root path stays free for the API):
+`webui` 启用（默认）时，二进制会在 `/webui` 路径托管内嵌的单文件管理界面（根路径留给 API，不提供页面）：
 
 ```text
 http://localhost:11434/webui
 ```
 
-Log in with the server address and `admin_password`. The same `internal/web/index.html` can also be opened directly in a browser and pointed at any running instance.
+使用服务器地址 + `admin_password` 登录。`internal/web/index.html` 也可以直接用浏览器打开，填任意运行实例的地址使用。
 
-Tabs:
+各页签：
 
-- **Overview** — version, uptime, listen address, usage counters, account/key/model summaries, and a quota sync summary (synced / exceeded / low-balance accounts, last refresh)
-- **Accounts** — add (paste a key, or run OAuth and paste the redirect link when the browser cannot reach the server), edit name/key, enable/disable, connectivity test, quota refresh, delete; per-account requests, tokens, errors, cooldown state, last error, and quota. OAuth-added accounts are named after the Command Code user automatically
-- **Models** — checkbox list of upstream models; checked = exposed via `/v1/models` and callable, unchecked = hidden. This is the editor for `exclude_models` and applies live
-- **Keys** — create local client API keys, enable/disable, copy, delete; per-key usage (see [Client keys](#client-keys))
-- **Settings** — edit `base_url` (live), `host`/`port`/`webui` (persisted, applied on restart), and change the admin password (requires the current password; every existing admin session is kicked afterwards)
-- **Logs** — tail of the in-memory log ring (last 500 lines)
+- **概览**：版本、运行时长、监听地址、用量统计、账号/密钥/模型概览、额度同步汇总（已同步 / 超限 / 低余额账号数、最近刷新时间）
+- **账号**：添加（粘贴 Key；或走 OAuth，浏览器访问不到服务器时粘贴跳转链接）、编辑名称/Key、启用/禁用、连通性测试、刷新额度、删除；展示每账号请求数、tokens、错误、冷却状态、最近错误与额度。OAuth 添加的账号按登录账号名自动命名
+- **模型**：上游模型复选框列表，勾选 = 对外提供（`/v1/models` 可见、可调用），取消勾选 = 隐藏并拒绝调用；本页即 exclude_models 的可视化编辑器，改动即时生效
+- **密钥**：新建客户端 API Key、启用/禁用、复制、删除；每把密钥独立用量统计（见[客户端密钥](#客户端密钥)）
+- **设置**：`base_url`（即时生效）、`host`/`port`/`webui`（写盘后重启生效）、修改管理密码（需提供原密码，成功后踢出所有已登录管理会话）
+- **日志**：内存日志环形缓冲（最近 500 行）实时查看
 
-Changes to accounts and settings are written back to `config.yaml` immediately — no restart needed.
+账号与设置的修改会立即写回 `config.yaml`，无需重启。
 
-Security notes: admin authentication is rate limited per source IP (5 failed attempts in 10 minutes locks the source out for 15 minutes), responses carry hardening headers (CSP, `X-Frame-Options: DENY`, `nosniff`, `Referrer-Policy: no-referrer`) and are never cached, and the login form supports password managers (Bitwarden et al.). "Remember password" keeps the credential in `localStorage`; unchecked, it lives in `sessionStorage` and dies with the tab.
+安全机制：管理接口按来源 IP 限速（10 分钟内失败 5 次锁定 15 分钟）、响应携带安全头（CSP、`X-Frame-Options: DENY`、`nosniff`、`Referrer-Policy: no-referrer`）且禁用缓存、登录表单兼容 Bitwarden 等密码管理器；「记住密码」存于 localStorage，取消勾选则仅存 sessionStorage（关标签页即失效）。
 
-### Quota dashboard
+### 额度仪表盘
 
-The Accounts tab shows each account's Command Code quota, read with the same API key from the undocumented `/alpha/*` endpoints (`whoami`, `billing/credits`, `billing/subscriptions`, `usage/summary`):
+「账号」页展示每个账号的 Command Code 额度，使用同一个 API Key 读取未公开的 `/alpha/*` 接口（`whoami`、`billing/credits`、`billing/subscriptions`、`usage/summary`）：
 
-- **5-hour** and **weekly** bars come straight from the upstream `windowLimits` objects. Bars grade amber at ≥50% used, heavier amber at ≥75%, and red at ≥90%.
-- **Monthly** is *derived*: the API exposes no monthly window, so the cap comes from the community CLI's plan mapping (`individual-pro` → 30, `individual-pro-v1` → 80, …), with `used = cap − remaining credits`. It is labelled as estimated; unknown plans fall back to balance-only display.
-- Credit balances (monthly remaining / purchased / free), plan name and status, billing-period end, and billing-period totals.
-- A per-account **refresh quota** button and a **refresh all** button (which returns immediately and refreshes in the background).
+- **5 小时**、**本周**进度条直接来自上游 `windowLimits`；已用 ≥50% 显示黄色、≥75% 深黄、≥90% 红色。
+- **月度**为推算值：接口没有月度窗口对象，上限来自社区 CLI 的套餐映射（`individual-pro` → 30、`individual-pro-v1` → 80 等），已用 = 上限 − 剩余月度额度，界面上标注"按套餐估算"；未知套餐仅显示余额。
+- 余额（月度剩余 / 充值 / 免费）、套餐名称与状态、账期结束时间、账期用量统计。
+- 账号页提供单账号「刷新额度」与「刷新全部额度」按钮（后者立即返回，后台刷新）。
 
-Quota refresh runs once shortly after startup and every 5 minutes afterwards; the latest snapshot is cached in `usage.json` so it survives restarts. A failed query keeps the last successful snapshot and only records the error and check time. These endpoints come from [commandcode-usage](https://github.com/MAXeaglet/commandcode-usage); they are unofficial, so the parser tolerates field drift (camelCase or snake_case, epoch seconds / milliseconds / ISO timestamps, flat or `data`-wrapped responses).
+额度会在启动后不久自动刷新一次，之后每 5 分钟刷新一次，快照缓存在 `usage.json` 中，重启后仍然保留。查询失败时保留上一次成功的数据，只更新错误与查询时间。接口路径取自
+[commandcode-usage](https://github.com/MAXeaglet/commandcode-usage)，属未公开接口，解析层兼容字段漂移（camelCase / snake_case、秒 / 毫秒 / ISO 时间、顶层或 `data` 嵌套）。
 
-### Admin API
+### 管理 API
 
-The UI talks to a JSON API under `/admin/api/*`, authenticated with `Authorization: Bearer <admin_password>` (works for scripts and curl too):
+UI 通过 `/admin/api/*` 访问管理接口，鉴权方式为 `Authorization: Bearer <admin_password>`，脚本 / curl 同样可用：
 
 ```text
 GET    /admin/api/overview
 GET    /admin/api/accounts
 POST   /admin/api/accounts             {"name": "...", "api_key": "..."}
-PATCH  /admin/api/accounts/{id}        {"enabled": true}, {"name": "..."} or {"api_key": "..."}
+PATCH  /admin/api/accounts/{id}        {"enabled": true} 或 {"name": "..."}
 DELETE /admin/api/accounts/{id}
 POST   /admin/api/accounts/{id}/test
 POST   /admin/api/accounts/{id}/quota/refresh
-POST   /admin/api/quotas/refresh       202 + background refresh of every account; with {"id": "..."} it refreshes one account synchronously
+POST   /admin/api/quotas/refresh       202 立即返回并在后台刷新全部账号；带 {"id": "..."} 时同步刷新单个账号
 GET    /admin/api/models
 PUT    /admin/api/models               {"exposed": ["model-id", ...]}
 GET    /admin/api/keys
-POST   /admin/api/keys                 {"name": "..."} — the key value is always server-generated
+POST   /admin/api/keys                 {"name": "..."} — 密钥值一律由服务端生成，不接受指定
 GET    /admin/api/keys/{id}/reveal
-PATCH  /admin/api/keys/{id}            {"enabled": true} or {"name": "..."}
+PATCH  /admin/api/keys/{id}            {"enabled": true} 或 {"name": "..."}
 DELETE /admin/api/keys/{id}
 GET    /admin/api/settings
 PUT    /admin/api/settings
 GET    /admin/api/logs?after=SEQ
 POST   /admin/api/oauth/start
-POST   /admin/api/oauth/complete   {"callback_url": "<浏览器跳转后的完整链接>"}
 GET    /admin/api/oauth/status
 POST   /admin/api/oauth/cancel
 ```
 
-`GET /admin/api/accounts` includes a nested `quota` object per account; `GET /admin/api/overview` includes a `quotas` summary (`synced`, `exceeded`, `low_balance`, `last_checked_at`).
+`GET /admin/api/accounts` 每个账号带嵌套 `quota` 对象；`GET /admin/api/overview` 带 `quotas` 汇总（`synced`、`exceeded`、`low_balance`、`last_checked_at`）。
 
 ## HTTP API
 
 ### `GET /health`
 
-No authentication required.
+无需鉴权。
 
 ```json
 {"status":"ok"}
@@ -255,7 +314,7 @@ No authentication required.
 
 ### `GET /usage`
 
-No authentication required. Returns locally accumulated usage counters plus per-account and per-client-key breakdowns:
+需要客户端 Bearer 鉴权（快照包含每个账号与每把密钥的用量明细，公网实例不应匿名暴露这份用量画像）。返回本地累计用量计数，以及按账号、按客户端密钥的明细：
 
 ```json
 {
@@ -273,49 +332,53 @@ No authentication required. Returns locally accumulated usage counters plus per-
 }
 ```
 
-Usage is persisted to `usage.json`, which is ignored by git. Cached quota snapshots also live in that file but are never exposed here.
+用量持久化在 `usage.json`（git 忽略）。缓存的额度快照也存在该文件中，但不会出现在本端点。
 
 ### `GET /v1/models`
 
-Returns the model list after applying `exclude_models` filtering, so excluded models do not appear. Each entry carries a `context_window` field when the upstream reports one.
+返回应用 `exclude_models` 过滤后的模型列表，被排除的模型不会出现。上游提供时，每个条目附带 `context_window` 字段（上下文窗口大小）。
 
 ### `POST /v1/chat/completions`
 
-Accepts OpenAI-style chat completion requests and forwards them to Command Code. Requests for excluded models return `404` with an OpenAI-compatible error JSON shape.
+接受 OpenAI 风格的 chat completion 请求并转发到 Command Code。命中 `exclude_models` 的请求返回 `404` 和 OpenAI 兼容的错误 JSON。
 
-**Model IDs** must match `/v1/models` output exactly, including the provider prefix:
+**模型 ID** 必须与 `/v1/models` 返回的完全一致，包含 provider 前缀：
 
 ```text
 deepseek/deepseek-v4-flash          ✓
-deepseek-v4-flash                   ✗ missing provider prefix
-deepseek-ai/deepseek-v4-flash       ✗ wrong provider prefix
+deepseek-v4-flash                   ✗ 缺少 provider 前缀
+deepseek-ai/deepseek-v4-flash       ✗ provider 前缀错误
 ```
 
-**Supported request styles:** plain text messages, multimodal content arrays, `stream: true` server-sent events, and `stream: false` JSON responses.
+**支持的请求形式**：纯文本消息、多模态 content 数组、`stream: true` 的 SSE 流式响应、`stream: false` 的 JSON 响应。
 
-**Images:** multimodal `image_url` values must be base64 `data:image/...;base64,...` URLs. Remote HTTP(S) image URLs are rejected with `400 invalid_request_error` — the gateway never downloads remote images.
+**被忽略的 OpenAI 参数**：`temperature`、`top_p`、`stop`、`seed`、`response_format`、`n`、`presence_penalty`、`frequency_penalty`、`logit_bias`、`logprobs`、`top_logprobs`、`user` 在 Command Code 上游没有对应字段，会被丢弃（请求仍成功）。网关在 `--debug` 下会打印一条 `[WARN] unsupported request parameters dropped` 日志，便于排查「设置了却不生效」的困惑。`max_tokens` 超过上游 200000 上限时会被截断到该值，同时返回 `x-cmdcode2api-max-tokens-clamped` 响应头。
 
-Upstream `inputTokenDetails.cacheReadTokens` is exposed in the response as `usage.prompt_tokens_details.cached_tokens`. `cacheWriteTokens` is available in `/usage` but not in the Chat Completions response, because OpenAI's standard usage schema has no cache-write field.
+**未知 role**：Command Code 只接受 `user` / `assistant` / `tool`（`system` / `developer` 已提升为顶层 system 提示）。其余 role（例如拼错的 `asistant`）会降级为 `user` 并打印告警，避免整段对话被静默错误归因。
 
-## Running behind nginx
+**图片**：多模态 `image_url` 必须使用 `data:image/...;base64,...` 形式；远程 HTTP(S) 图片地址返回 `400 invalid_request_error`，服务不会主动下载远程图片。
 
-If nginx and cmdcode2api run on the same host, keep forwarding Cloudflare's `CF-Connecting-IP` and `X-Forwarded-For` headers. The server accepts these headers only from loopback proxy connections, then uses the resolved address for HTTP logs and admin login rate limiting. Direct connections with forged proxy headers continue to use their TCP peer address.
+上游 `inputTokenDetails.cacheReadTokens` 在响应中对应 `usage.prompt_tokens_details.cached_tokens`。`cacheWriteTokens` 可在 `/usage` 查看，但不出现在 Chat Completions 响应中——OpenAI 的标准 usage 结构没有 cache-write 字段。
 
-For `X-Forwarded-For`, only the rightmost entry (the one an appending proxy wrote) is honored: leftmost entries are client-controlled, and a client forging a fresh one per request would rotate its rate-limit key. Do not preserve the client-supplied header via `proxy_add_x_forwarded_for`, and prefer allowing only Cloudflare's published proxy CIDRs at the nginx level so `CF-Connecting-IP` cannot be forged by connecting to the origin directly. If nginx itself also needs `$remote_addr` to represent the end user, configure `real_ip_header CF-Connecting-IP` with Cloudflare's published proxy CIDRs.
+## 反向代理（nginx）
 
-Client Bearer Tokens are any key from the `api_keys` list in `config.yaml`.
+如果 nginx 与 cmdcode2api 在同一台主机，请继续转发 Cloudflare 的 `CF-Connecting-IP` 和 `X-Forwarded-For`。服务端只接受来自本机回环代理连接的这些请求头，并将解析后的地址用于 HTTP 日志和管理登录限流；直连请求即使携带伪造请求头，也仍使用 TCP 对端地址。
 
-## Project layout
+`X-Forwarded-For` 只取最右侧（由追加代理写入）的地址：左侧条目客户端可以任意伪造，伪造者换个 IP 就能绕过登录限流。因此请勿让 nginx 用 `proxy_add_x_forwarded_for` 保留客户端自带的该请求头，并建议在 nginx 层只放行 Cloudflare 官方公布的代理网段，防止绕过 CF 直连源站伪造 `CF-Connecting-IP`。若还需要让 nginx 自身的 `$remote_addr` 表示最终用户，请在 nginx 中配置 `real_ip_header CF-Connecting-IP`，并填写 Cloudflare 官方公布的代理网段。
+
+客户端 Bearer Token 使用 `config.yaml` 里 `api_keys` 列表中的任意一把密钥。
+
+## 项目结构
 
 ```text
-cmd/cmdcode2api/   CLI entrypoint
-internal/app/      gateway implementation
-internal/web/      embedded single-file WebUI (index.html)
+cmd/cmdcode2api/   CLI 入口
+internal/app/      网关实现
+internal/web/      内嵌单文件 WebUI（index.html）
 ```
 
-## Files intentionally not committed
+## 本地运行产物
 
-The repository ignores runtime/secrets artifacts:
+以下文件不应提交到 Git：
 
 ```text
 cmdcode2api
@@ -323,10 +386,30 @@ cc-gateway
 config.yaml
 usage.json
 *.exe
+*.pid
+*.log
 .oauth_state
 .oauth_url
 ```
 
-## Notes
+Windows 下用 `start.bat` / `start.ps1` 后台启动时，日志重定向到 `cmdcode2api.log`；`start.ps1` 每次启动前检查该文件，超过 10 MB 就滚动为 `cmdcode2api.log.1`（只保留一份历史）。`usage.json` 采用去抖写入：请求路径只置脏标记，后台每秒合并落盘一次，进程退出时兜底 `Flush`。文件损坏时不会被清空，而是改名为 `usage.json.bak` 并告警。
 
-This is a personal utility gateway and currently targets the Command Code API shape observed during development. If Command Code changes its internal API, the adapter may need updates. The project was originally named `cc-gateway` and was renamed to avoid confusion with Claude Code's common `cc` abbreviation.
+### Windows 管理脚本
+
+| 脚本 | 作用 |
+| --- | --- |
+| `start.bat` / `start.ps1` | 后台静默启动（日志写入 `cmdcode2api.log`），就绪后自动打开 WebUI |
+| `start-console.bat` | 前台控制台窗口启动，便于直接看输出 |
+| `stop.bat` / `stop.ps1` | 按 PID 文件精准停止，并兜底清理残留进程 |
+| `restart.bat` / `restart.ps1` | 先停止再启动 |
+| `status.bat` / `status.ps1` | 查看运行状态、PID、内存占用、健康探测与最近 10 行日志 |
+| `menu.bat` | 交互式菜单，串起以上所有操作 |
+| `oauth.bat` | 启动 `--oauth` 浏览器授权，绑定 Command Code 账号 |
+
+`start.ps1` 会在启动前比较源码与 `cmdcode2api.exe` 的修改时间：源码更新时自动重新编译；若此时旧进程仍在运行，会先停掉它再启动，确保改动真正生效（只判断「exe 是否存在」会让双击后依旧跑旧二进制）。
+
+> **编码注意**：这些 `.ps1` 由 `powershell.exe`（Windows PowerShell 5.1）执行，它会用系统 ANSI 代码页解码**不带 BOM** 的脚本文件。脚本内含中文提示，一旦 BOM 丢失就会解析失败（报 `数组索引表达式缺失或无效` / `字符串缺少终止符`）。因此**每个 `.ps1` 必须保留 UTF-8 BOM**，仓库用 `.gitattributes` 固定该约定；`.bat` 则保持无 BOM 的 CRLF。
+
+## 说明
+
+这是个人使用的工具型网关，目前针对开发期间观察到的 Command Code API 形态。若 Command Code 调整内部 API，适配层可能需要更新。项目原名 `cc-gateway`，为避免与 Claude Code 常见的 `cc` 缩写混淆而更名。

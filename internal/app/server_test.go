@@ -2,6 +2,7 @@ package app
 
 import (
 	"bytes"
+	"fmt"
 	"log"
 	"net/http"
 	"net/http/httptest"
@@ -86,6 +87,124 @@ func TestCorsPreflightBypassesAuth(t *testing.T) {
 
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+// TestUsageRequiresClientKey pins the fix for the anonymously readable usage
+// snapshot: /usage carries per-account and per-client-key counters, so it must
+// sit behind the same Bearer check as /v1/*.
+func TestUsageRequiresClientKey(t *testing.T) {
+	cfg := &Config{APIKey: "secret"}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/usage", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"total_requests":0}`)
+	})
+	handler := corsMiddleware(authMiddleware(cfg, nil)(mux))
+
+	req := httptest.NewRequest(http.MethodGet, "/usage", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("anonymous /usage status = %d, want 401", rec.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/usage", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("authenticated /usage status = %d, want 200", rec.Code)
+	}
+}
+
+// TestCorsHeadersOnlyOnV1Paths keeps the wildcard ACAO off the admin surface:
+// a page on any origin could otherwise read /admin/* or /usage from a victim's
+// browser.
+func TestCorsHeadersOnlyOnV1Paths(t *testing.T) {
+	ok := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	handler := corsMiddleware(ok)
+
+	for _, path := range []string{"/v1/models", "/v1/chat/completions", "/v1"} {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+			t.Fatalf("%s: ACAO = %q, want *", path, got)
+		}
+	}
+
+	for _, path := range []string{"/usage", "/admin/api/overview", "/webui", "/health"} {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "" {
+			t.Fatalf("%s: ACAO = %q, want empty", path, got)
+		}
+	}
+}
+
+// TestCorsPreflightOutsideV1ReachesAuthChain makes sure an OPTIONS request on a
+// non-/v1 path is not answered 204 before authentication.
+func TestCorsPreflightOutsideV1ReachesAuthChain(t *testing.T) {
+	reached := false
+	handler := corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached = true
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodOptions, "/admin/api/overview", nil))
+	if !reached {
+		t.Fatal("OPTIONS /admin/api/overview short-circuited before the auth chain")
+	}
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+}
+
+// TestClientKeyAuthLocksOutAfterRepeatedFailures covers the brute-force guard
+// on the client-key space, which previously had none.
+func TestClientKeyAuthLocksOutAfterRepeatedFailures(t *testing.T) {
+	cfg := &Config{APIKey: "secret"}
+	handler := authMiddleware(cfg, nil)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	locked := false
+	for i := 0; i < clientKeyFailLimit+2 && !locked; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		req.RemoteAddr = "198.51.100.5:1234"
+		req.Header.Set("Authorization", "Bearer wrong-key")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		locked = rec.Code == http.StatusTooManyRequests
+	}
+	if !locked {
+		t.Fatalf("client key auth never locked out after %d failures", clientKeyFailLimit+2)
+	}
+
+	// While locked, even the correct key is refused and Retry-After is set.
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.RemoteAddr = "198.51.100.5:1234"
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", rec.Code)
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Fatal("429 response is missing Retry-After")
+	}
+
+	// A different source IP is unaffected.
+	req = httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.RemoteAddr = "198.51.100.6:1234"
+	req.Header.Set("Authorization", "Bearer secret")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("other IP status = %d, want 200", rec.Code)
 	}
 }
 

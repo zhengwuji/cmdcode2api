@@ -36,7 +36,7 @@ func TestAccountPoolRoundRobin(t *testing.T) {
 		if acct == nil {
 			t.Fatalf("Acquire() = nil at %d", i)
 		}
-		order = append(order, acct.APIKey)
+		order = append(order, acct.APIKey())
 	}
 	want := []string{"key-a", "key-b", "key-c", "key-a", "key-b", "key-c"}
 	for i := range want {
@@ -55,7 +55,7 @@ func TestAccountPoolSkipsDisabledAndRateLimited(t *testing.T) {
 
 	for i := 0; i < 3; i++ {
 		acct := pool.Acquire()
-		if acct == nil || acct.APIKey != "key-c" {
+		if acct == nil || acct.APIKey() != "key-c" {
 			t.Fatalf("Acquire() = %v, want key-c", acct)
 		}
 	}
@@ -179,7 +179,7 @@ func TestCCClientFailoverOnRateLimit(t *testing.T) {
 		t.Fatalf("Send error: %v", err)
 	}
 	resp.Body.Close()
-	if acct == nil || acct.APIKey != "key-b" {
+	if acct == nil || acct.APIKey() != "key-b" {
 		t.Fatalf("served by %v, want key-b", acct)
 	}
 	if len(seen) != 2 || seen[0] != "key-a" || seen[1] != "key-b" {
@@ -196,7 +196,7 @@ func TestCCClientFailoverOnRateLimit(t *testing.T) {
 		t.Fatalf("second Send error: %v", err)
 	}
 	resp.Body.Close()
-	if acct == nil || acct.APIKey != "key-b" {
+	if acct == nil || acct.APIKey() != "key-b" {
 		t.Fatalf("second request served by %v, want key-b", acct)
 	}
 	if len(seen) != 1 || seen[0] != "key-b" {
@@ -219,7 +219,7 @@ func TestCCClientNoFailoverOnInvalidRequest(t *testing.T) {
 	if !errors.As(err, &upstreamErr) || upstreamErr.Status != http.StatusBadRequest {
 		t.Fatalf("error = %v, want 400 upstreamAPIError", err)
 	}
-	if acct == nil || acct.APIKey != "key-a" {
+	if acct == nil || acct.APIKey() != "key-a" {
 		t.Fatalf("account = %v, want key-a", acct)
 	}
 	if calls != 1 {
@@ -306,13 +306,13 @@ func TestUsageForAccountRecordsSeparately(t *testing.T) {
 	if snap.TotalRequests != 3 || snap.PromptTokens != 111 || snap.CompletionTokens != 122 {
 		t.Fatalf("totals = %+v", snap)
 	}
-	acc := usage.AccountUsage(acct.ID)
+	acc := usage.AccountUsage(acct.ID())
 	if acc.Requests != 2 || acc.PromptTokens != 11 || acc.CompletionTokens != 22 || acc.CacheReadTokens != 3 {
 		t.Fatalf("account usage = %+v", acc)
 	}
 
-	usage.DropAccount(acct.ID)
-	if got := usage.AccountUsage(acct.ID); got.Requests != 0 {
+	usage.DropAccount(acct.ID())
+	if got := usage.AccountUsage(acct.ID()); got.Requests != 0 {
 		t.Fatalf("dropped account usage = %+v", got)
 	}
 }

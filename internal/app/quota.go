@@ -294,7 +294,14 @@ func parseQuotaWindow(raw map[string]any) *QuotaWindow {
 	return window
 }
 
-func buildQuotaPlan(planID string, data map[string]any) *QuotaPlan {
+// buildQuotaPlan assembles the plan block. observedRemaining is the monthly
+// credit balance the billing API reported, if any. The upstream exposes no
+// monthly window object, so the cap comes from the knownPlans mapping and is
+// an estimate; the balance is used only to detect that the mapping has gone
+// stale (an account holding more credits than its plan grants means the table
+// is out of date, and keeping the smaller number would render a nonsense
+// "0 used" bar).
+func buildQuotaPlan(planID string, data map[string]any, observedRemaining *float64) *QuotaPlan {
 	plan := &QuotaPlan{PlanID: planID}
 	if data != nil {
 		plan.Status = strField(data, "status")
@@ -306,6 +313,9 @@ func buildQuotaPlan(planID string, data map[string]any) *QuotaPlan {
 	if spec, ok := planInfo(planID); ok {
 		plan.Name = spec.Name
 		credits := spec.MonthlyCredits
+		if observedRemaining != nil && *observedRemaining > credits {
+			credits = *observedRemaining
+		}
 		plan.MonthlyCredits = &credits
 	} else {
 		plan.Name = planID
@@ -453,7 +463,7 @@ func fetchQuotaSnapshot(ctx context.Context, client *http.Client, baseURL, apiKe
 	}
 	if sub, err := quotaGet(ctx, client, subURL, apiKey); err != nil {
 		if planIDFallback != "" {
-			snap.Plan = buildQuotaPlan(planIDFallback, nil)
+			snap.Plan = buildQuotaPlan(planIDFallback, nil, snap.MonthlyCredits)
 		}
 		failures = append(failures, "billing/subscriptions: "+err.Error())
 	} else {
@@ -466,7 +476,7 @@ func fetchQuotaSnapshot(ctx context.Context, client *http.Client, baseURL, apiKe
 			planID = planIDFallback
 		}
 		if data != nil || planID != "" {
-			snap.Plan = buildQuotaPlan(planID, data)
+			snap.Plan = buildQuotaPlan(planID, data, snap.MonthlyCredits)
 		}
 	}
 
@@ -534,18 +544,18 @@ func (s *QuotaService) RefreshAccount(ctx context.Context, acct *Account) *Quota
 		return nil
 	}
 
-	snap, err := fetchQuotaSnapshot(ctx, s.client, s.cc.BaseURLValue(), acct.APIKey)
+	snap, err := fetchQuotaSnapshot(ctx, s.client, s.cc.BaseURLValue(), acct.APIKey())
 	now := time.Now()
 	if err != nil {
-		snap = cloneForQuotaError(s.usage.Quota(acct.ID), err.Error(), now)
-		s.usage.SetQuota(acct.ID, snap)
+		snap = cloneForQuotaError(s.usage.Quota(acct.ID()), err.Error(), now)
+		s.usage.SetQuota(acct.ID(), snap)
 		s.persist()
-		log.Printf("[WARN] quota refresh for account %s failed: %v", acct.Name, err)
+		log.Printf("[WARN] quota refresh for account %s failed: %v", acct.Name(), err)
 		return snap
 	}
 	snap.LastChecked = &now
 	snap.LastError = ""
-	s.usage.SetQuota(acct.ID, snap)
+	s.usage.SetQuota(acct.ID(), snap)
 	s.persist()
 	return snap
 }
@@ -624,8 +634,8 @@ func (s *QuotaService) Run(ctx context.Context) {
 	}
 }
 
+// persist flags the tracker for the background flusher. Quota refreshes used to
+// rewrite usage.json once per account per cycle; the flusher coalesces them.
 func (s *QuotaService) persist() {
-	if err := s.usage.save(); err != nil {
-		log.Printf("[WARN] save quota data failed: %v", err)
-	}
+	s.usage.markDirty()
 }

@@ -106,9 +106,9 @@ func handleAdminOverview(cfg *Config, pool *AccountPool, keys *ClientKeyPool, us
 	return func(w http.ResponseWriter, r *http.Request) {
 		total, enabled, rateLimited := pool.Stats()
 		keyTotal, keyEnabled := keys.Stats()
-		loaded := len(modelCatalog)
+		loaded := modelCount()
 		available := 0
-		for _, m := range modelCatalog {
+		for _, m := range modelSnapshot() {
 			if !isModelExcluded(m.ID, cfg.Excludes()) {
 				available++
 			}
@@ -220,14 +220,14 @@ func handleAdminAccountAdd(pool *AccountPool, cfg *Config, usage *UsageTracker, 
 		}
 		// Started without accounts? The model catalog is empty then; fetch it
 		// now so /v1/models and the Models tab fill in immediately.
-		if len(modelCatalog) == 0 && acct.Enabled {
-			FetchProviderModels(cfg.UpstreamBaseURL(), acct.APIKey)
+		if modelCount() == 0 && acct.IsEnabled() {
+			FetchProviderModels(cfg.UpstreamBaseURL(), acct.APIKey())
 		}
 		// The first quota query runs in the background so adding an account
 		// stays fast; the UI picks the snapshot up on its next poll.
 		quotas.RefreshAsync(acct)
-		log.Printf("account %q added via webui", acct.Name)
-		writeAdminJSON(w, 201, adminAccount{AccountView: acct.View(), UsageSnapshotEntry: usage.AccountUsage(acct.ID), Quota: usage.Quota(acct.ID)})
+		log.Printf("account %q added via webui", acct.Name())
+		writeAdminJSON(w, 201, adminAccount{AccountView: acct.View(), UsageSnapshotEntry: usage.AccountUsage(acct.ID()), Quota: usage.Quota(acct.ID())})
 	}
 }
 
@@ -309,7 +309,7 @@ func handleAdminAccountQuotaRefresh(pool *AccountPool, usage *UsageTracker, quot
 			return
 		}
 		quotas.RefreshAccount(r.Context(), acct)
-		writeAdminJSON(w, 200, adminAccount{AccountView: acct.View(), UsageSnapshotEntry: usage.AccountUsage(acct.ID), Quota: localizeQuotaSnapshot(i18n.FromRequest(r), usage.Quota(acct.ID))})
+		writeAdminJSON(w, 200, adminAccount{AccountView: acct.View(), UsageSnapshotEntry: usage.AccountUsage(acct.ID()), Quota: localizeQuotaSnapshot(i18n.FromRequest(r), usage.Quota(acct.ID()))})
 	}
 }
 
@@ -356,8 +356,9 @@ type adminModel struct {
 func handleAdminModelsGet(cfg *Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		excludes := cfg.Excludes()
-		models := make([]adminModel, 0, len(modelCatalog))
-		for _, m := range modelCatalog {
+		catalog := modelSnapshot()
+		models := make([]adminModel, 0, len(catalog))
+		for _, m := range catalog {
 			models = append(models, adminModel{ID: m.ID, Exposed: !isModelExcluded(m.ID, excludes)})
 		}
 		writeAdminJSON(w, 200, map[string]any{"models": models, "exclude_models": excludes})
@@ -382,9 +383,10 @@ func handleAdminModelsPut(cfg *Config) http.HandlerFunc {
 			exposed[strings.TrimSpace(id)] = true
 		}
 
-		excludes := make([]string, 0, len(modelCatalog))
-		known := make(map[string]bool, len(modelCatalog))
-		for _, m := range modelCatalog {
+		catalog := modelSnapshot()
+		excludes := make([]string, 0, len(catalog))
+		known := make(map[string]bool, len(catalog))
+		for _, m := range catalog {
 			known[m.ID] = true
 			if !exposed[m.ID] {
 				excludes = append(excludes, m.ID)
@@ -464,13 +466,13 @@ func handleAdminKeyAdd(keys *ClientKeyPool, cfg *Config, usage *UsageTracker) ht
 			writeAdminError(w, r, 500, "key created but saving config failed: "+err.Error())
 			return
 		}
-		log.Printf("client key %q added via webui", key.Name)
+		log.Printf("client key %q added via webui", key.Name())
 		// The full key value is returned exactly once, at creation.
 		writeAdminJSON(w, 201, map[string]any{
-			"id":         key.ID,
-			"name":       key.Name,
-			"key":        key.Key,
-			"enabled":    key.Enabled,
+			"id":         key.ID(),
+			"name":       key.Name(),
+			"key":        key.Key(),
+			"enabled":    key.IsEnabled(),
 			"key_masked": key.MaskedKey(),
 		})
 	}
@@ -484,7 +486,7 @@ func handleAdminKeyReveal(keys *ClientKeyPool) http.HandlerFunc {
 			writeAdminError(w, r, 404, "key not found")
 			return
 		}
-		writeAdminJSON(w, 200, map[string]any{"id": key.ID, "key": key.Key})
+		writeAdminJSON(w, 200, map[string]any{"id": key.ID(), "key": key.Key()})
 	}
 }
 
@@ -543,7 +545,7 @@ func handleAdminAccountTest(pool *AccountPool, cc *CCClient) http.HandlerFunc {
 			writeAdminError(w, r, 404, "account not found")
 			return
 		}
-		result := testAccountKey(cc.BaseURLValue(), acct.APIKey)
+		result := testAccountKey(cc.BaseURLValue(), acct.APIKey())
 		writeAdminJSON(w, 200, result)
 	}
 }
@@ -597,11 +599,12 @@ func handleAdminSettingsGet(cfg *Config) http.HandlerFunc {
 }
 
 func adminSettingsFrom(cfg *Config) adminSettings {
+	host, port := cfg.Listen()
 	return adminSettings{
 		BaseURL:          cfg.UpstreamBaseURL(),
 		ExcludeModels:    cfg.Excludes(),
-		Host:             cfg.Host,
-		Port:             cfg.Port,
+		Host:             host,
+		Port:             port,
 		WebUI:            cfg.WebUIEnabled(),
 		AdminPasswordSet: cfg.adminPassword() != "",
 	}
@@ -664,23 +667,24 @@ func handleAdminSettingsPut(cfg *Config, cc *CCClient, pool *AccountPool) http.H
 		}
 		if body.AdminPassword != nil {
 			password := strings.TrimSpace(*body.AdminPassword)
-			if len(password) < 8 {
-				writeAdminError(w, r, 400, "admin_password must be at least 8 characters")
-				return
-			}
 			// 管理认证就是密码本身：改完即踢出所有已持有的旧凭据。
+			// 长度与旧密码校验已在上方统一完成。
 			cfg.setAdminPassword(password)
 		}
+		host, port := cfg.Listen()
 		if body.Host != nil && strings.TrimSpace(*body.Host) != "" {
-			cfg.Host = strings.TrimSpace(*body.Host)
+			host = strings.TrimSpace(*body.Host)
 			restartRequired = append(restartRequired, "host")
 		}
 		if body.Port != nil && *body.Port > 0 {
-			cfg.Port = *body.Port
+			port = *body.Port
 			restartRequired = append(restartRequired, "port")
 		}
+		if body.Host != nil || body.Port != nil {
+			cfg.SetListen(host, port)
+		}
 		if body.WebUI != nil {
-			cfg.WebUI = body.WebUI
+			cfg.SetWebUI(body.WebUI)
 			restartRequired = append(restartRequired, "webui")
 		}
 
@@ -776,7 +780,7 @@ func handleAdminOAuthStart(pool *AccountPool, cfg *Config, quotas *QuotaService)
 				log.Printf("[WARN] webui oauth: add account failed: %v", err)
 				return
 			}
-			log.Printf("✓ OAuth account %q added via webui (user %s)", acct.Name, cb.UserName)
+			log.Printf("✓ OAuth account %q added via webui (user %s)", acct.Name(), cb.UserName)
 		}()
 
 		writeAdminJSON(w, 200, map[string]any{"state": "pending", "auth_url": flow.AuthURL})
@@ -801,8 +805,8 @@ func handleAdminOAuthStatus(pool *AccountPool) http.HandlerFunc {
 		case "success":
 			if cb, ok := flow.Result(); ok {
 				if acct := pool.Get(accountID(cb.APIKey)); acct != nil {
-					resp["account_id"] = acct.ID
-					resp["account_name"] = acct.Name
+					resp["account_id"] = acct.ID()
+					resp["account_name"] = acct.Name()
 				}
 			}
 		case "failed":
@@ -841,8 +845,8 @@ func addOAuthAccount(pool *AccountPool, cfg *Config, quotas *QuotaService, cb oa
 	if err := persistPool(pool, cfg); err != nil {
 		return nil, err
 	}
-	if len(modelCatalog) == 0 && acct.Enabled {
-		FetchProviderModels(cfg.UpstreamBaseURL(), acct.APIKey)
+	if modelCount() == 0 && acct.IsEnabled() {
+		FetchProviderModels(cfg.UpstreamBaseURL(), acct.APIKey())
 	}
 	quotas.RefreshAsync(acct)
 	return acct, nil
@@ -896,8 +900,8 @@ func handleAdminOAuthComplete(pool *AccountPool, cfg *Config, quotas *QuotaServi
 			writeAdminError(w, r, 500, err.Error())
 			return
 		}
-		log.Printf("✓ OAuth account %q added via pasted callback link (user %s)", acct.Name, cb.UserName)
-		writeAdminJSON(w, 200, map[string]any{"state": "success", "account_id": acct.ID, "account_name": acct.Name})
+		log.Printf("✓ OAuth account %q added via pasted callback link (user %s)", acct.Name(), cb.UserName)
+		writeAdminJSON(w, 200, map[string]any{"state": "success", "account_id": acct.ID(), "account_name": acct.Name()})
 	}
 }
 

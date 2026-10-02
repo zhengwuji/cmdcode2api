@@ -57,19 +57,46 @@ type Config struct {
 	ExcludeModels []string `yaml:"exclude_models"`
 	Debug         bool     `yaml:"-"` // runtime flag, not persisted
 
-	// mu guards the fields that the admin API mutates while request handlers
-	// read them (ExcludeModels, CommandCode.BaseURL, AdminPassword).
+	// mu guards every field that the admin API mutates while request handlers
+	// and background jobs read them: ExcludeModels, CommandCode.*, APIKeys,
+	// AdminPassword, Host, Port and WebUI.
 	mu sync.RWMutex
 }
 
+// Listen returns the configured bind host and port.
+func (c *Config) Listen() (string, int) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.Host, c.Port
+}
+
+func (c *Config) SetListen(host string, port int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.Host = host
+	c.Port = port
+}
+
 func (c *Config) WebUIEnabled() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.webUIEnabledLocked()
+}
+
+func (c *Config) SetWebUI(enabled *bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.WebUI = enabled
+}
+
+func (c *Config) webUIEnabledLocked() bool {
 	return c.WebUI == nil || *c.WebUI
 }
 
 func (c *Config) Excludes() []string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.ExcludeModels
+	return append([]string(nil), c.ExcludeModels...)
 }
 
 func (c *Config) SetExcludes(list []string) {
@@ -90,6 +117,31 @@ func (c *Config) SetUpstreamBaseURL(url string) {
 	c.CommandCode.BaseURL = url
 }
 
+// SetAccountsSnapshot replaces the persisted upstream account list together
+// with the legacy single-key field, under the same lock saveConfig uses.
+func (c *Config) SetAccountsSnapshot(accounts []AccountConfig) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.CommandCode.Accounts = accounts
+	if len(accounts) > 0 {
+		// Keeping the legacy field would resurrect deleted accounts on load.
+		c.CommandCode.APIKey = ""
+	}
+}
+
+// SetClientKeysSnapshot replaces the persisted client key list together with
+// the legacy single-key field, under the same lock saveConfig uses.
+func (c *Config) SetClientKeysSnapshot(keys []ClientKeyConfig) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.APIKeys = keys
+	if len(keys) > 0 {
+		c.APIKey = ""
+	}
+}
+
+// AdminPasswordHash is used only by tests that need to compare credentials
+// without reaching into the lock.
 func (c *Config) adminPassword() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -175,7 +227,17 @@ func saveConfig(path string, cfg *Config) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0600)
+	// Write via a temp file + rename so a crash mid-write cannot leave a
+	// truncated config.yaml behind.
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 func writeConfigTemplate(path string, cfg *Config) error {

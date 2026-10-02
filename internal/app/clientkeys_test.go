@@ -17,16 +17,16 @@ func TestClientKeyPoolBasics(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(generated.Key, "ccgw-") {
-		t.Fatalf("generated key = %q, want ccgw- prefix", generated.Key)
+	if !strings.HasPrefix(generated.Key(), "ccgw-") {
+		t.Fatalf("generated key = %q, want ccgw- prefix", generated.Key())
 	}
 
 	custom, err := pool.Add("mine", "ccgw-custom-1", true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if custom.ID != clientKeyID("ccgw-custom-1") {
-		t.Fatalf("id = %q", custom.ID)
+	if custom.ID() != clientKeyID("ccgw-custom-1") {
+		t.Fatalf("id = %q", custom.ID())
 	}
 
 	if _, err := pool.Add("dup", "ccgw-custom-1", true); err != errDuplicateClientKey {
@@ -40,14 +40,14 @@ func TestClientKeyPoolBasics(t *testing.T) {
 		t.Fatal("Lookup returned a key for unknown value")
 	}
 
-	if !pool.SetEnabled(custom.ID, false) {
+	if !pool.SetEnabled(custom.ID(), false) {
 		t.Fatal("SetEnabled failed")
 	}
-	if custom.Enabled {
+	if custom.IsEnabled() {
 		t.Fatal("custom should be disabled")
 	}
 
-	if !pool.Rename(custom.ID, "renamed") {
+	if !pool.Rename(custom.ID(), "renamed") {
 		t.Fatal("Rename failed")
 	}
 
@@ -65,7 +65,7 @@ func TestClientKeyPoolBasics(t *testing.T) {
 		t.Fatalf("reloaded pool = %d/%d, want 2/1", reloaded.Len(), reloaded.EnabledCount())
 	}
 
-	if !pool.Remove(generated.ID) || pool.Len() != 1 {
+	if !pool.Remove(generated.ID()) || pool.Len() != 1 {
 		t.Fatal("Remove failed")
 	}
 }
@@ -74,7 +74,7 @@ func TestAuthMiddlewareUsesClientKeyPool(t *testing.T) {
 	pool := NewClientKeyPool(nil)
 	k1, _ := pool.Add("first", "ccgw-key-1", true)
 	k2, _ := pool.Add("second", "ccgw-key-2", true)
-	pool.SetEnabled(k2.ID, false)
+	pool.SetEnabled(k2.ID(), false)
 
 	var seenKeyID string
 	handler := authMiddleware(nil, pool)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -95,8 +95,8 @@ func TestAuthMiddlewareUsesClientKeyPool(t *testing.T) {
 	if code := get("ccgw-key-1"); code != 200 {
 		t.Fatalf("valid key status = %d, want 200", code)
 	}
-	if seenKeyID != k1.ID {
-		t.Fatalf("context key id = %q, want %q", seenKeyID, k1.ID)
+	if seenKeyID != k1.ID() {
+		t.Fatalf("context key id = %q, want %q", seenKeyID, k1.ID())
 	}
 	if code := get("ccgw-key-2"); code != 401 {
 		t.Fatalf("disabled key status = %d, want 401", code)
@@ -255,7 +255,7 @@ func TestClientKeyRecorderFlowThroughHandler(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(
 		`{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":false}`))
 	req.Header.Set("Authorization", "Bearer ccgw-handler-key")
-	ctx := context.WithValue(req.Context(), ctxKeyClientKeyID, key.ID)
+	ctx := context.WithValue(req.Context(), ctxKeyClientKeyID, key.ID())
 	req = req.WithContext(ctx)
 
 	rec := httptest.NewRecorder()
@@ -265,7 +265,7 @@ func TestClientKeyRecorderFlowThroughHandler(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("handler status = %d, body = %s", rec.Code, rec.Body.String())
 	}
-	if got := usage.ClientKeyUsage(key.ID); got.Requests != 1 || got.PromptTokens != 3 || got.CompletionTokens != 4 {
+	if got := usage.ClientKeyUsage(key.ID()); got.Requests != 1 || got.PromptTokens != 3 || got.CompletionTokens != 4 {
 		t.Fatalf("client key usage = %+v", got)
 	}
 }

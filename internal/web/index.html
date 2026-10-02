@@ -378,6 +378,7 @@
         <button class="btn primary" id="ck-add-btn" data-i18n="keys.create">Create</button>
       </div>
       <p class="hint" data-i18n="keys.hint">Client keys are generated server-side (they cannot be chosen) and authenticate OpenAI-compatible requests to this gateway via Bearer auth. Usage is tracked per key; the full value is shown only once, at creation.</p>
+      <p class="hint" data-i18n="keys.rotateHint">Keys are stored in plaintext in config.yaml, so anything that can read that file can read them. Rotate a key if it has been pasted into a shared log, ticket, or chat: create the replacement first, switch your clients over, then delete the old one — this avoids a window with no working key.</p>
     </div>
     <div class="panel">
       <h3 data-i18n="keys.listTitle">Key list</h3>
@@ -688,6 +689,7 @@ const I18N = {
     "keys.namePlaceholder": "e.g. my-agent",
     "keys.create": "Create",
     "keys.hint": "Client keys are generated server-side (they cannot be chosen) and authenticate OpenAI-compatible requests to this gateway via Bearer auth. Usage is tracked per key; the full value is shown only once, at creation.",
+    "keys.rotateHint": "Keys are stored in plaintext in config.yaml, so anything that can read that file can read them. Rotate a key if it has been pasted into a shared log, ticket, or chat: create the replacement first, switch your clients over, then delete the old one — this avoids a window with no working key.",
     "keys.listTitle": "Key list",
     "keys.empty": "No keys yet — create one for your clients",
     "keys.created": "Key created: {key}",
@@ -899,6 +901,7 @@ const I18N = {
     "keys.namePlaceholder": "例如 my-agent",
     "keys.create": "新建",
     "keys.hint": "客户端密钥由服务端自动生成（无法手动指定），用于调用本网关的 OpenAI 兼容接口（Bearer 认证），每个密钥独立统计用量；完整值仅在创建时显示一次。",
+    "keys.rotateHint": "密钥以明文保存在 config.yaml 中，因此能读到该文件的人就能读到密钥。如果密钥曾被粘贴到共享日志、工单或聊天记录里，请轮换：先创建新密钥、切换客户端，再删除旧密钥，这样中间不会出现无可用密钥的空窗期。",
     "keys.listTitle": "密钥列表",
     "keys.empty": "还没有密钥 —— 新建一把给客户端使用",
     "keys.created": "密钥已创建：{key}",

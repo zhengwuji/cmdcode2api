@@ -9,8 +9,9 @@ import (
 	"runtime"
 )
 
-// Version is the program version, formatted as vX.Y.Z.
-const Version = "v0.2.0"
+// Version is the program version, formatted as vX.Y.Z. It is a variable so a
+// release build can stamp it: -ldflags "-X cmdcode2api/internal/app.Version=v1.2.3".
+var Version = "v0.3.0"
 
 // configFile is a var so tests can redirect config persistence to a temp dir.
 var configFile = "config.yaml"
@@ -57,7 +58,7 @@ func Run() {
 		// OAuth 追加账号而不是覆盖：重复执行即可接入多个账号。
 		pool := NewAccountPool(cfg.CommandCode.Accounts)
 		if acct := pool.Get(accountID(cb.APIKey)); acct != nil {
-			fmt.Printf("\nℹ️  API key already configured as account %q in %s\n", acct.Name, cfgPath)
+			fmt.Printf("\nℹ️  API key already configured as account %q in %s\n", acct.Name(), cfgPath)
 			return
 		}
 		name := cb.displayName()
@@ -130,24 +131,26 @@ Use the local client key above as the Bearer token for your OpenAI client.
 		adminPasswordGenerated = true
 	}
 
-	if cfg.Port == 0 {
-		cfg.Port = 11434
+	host0, port0 := cfg.Listen()
+	if port0 == 0 {
+		port0 = 11434
 	}
-	if cfg.Host == "" {
-		cfg.Host = "localhost"
+	if host0 == "" {
+		host0 = "localhost"
 	}
 	if *host != "" {
-		cfg.Host = *host
+		host0 = *host
 	}
 	if *port != 0 {
-		cfg.Port = *port
+		port0 = *port
 	}
+	cfg.SetListen(host0, port0)
 	if cfg.UpstreamBaseURL() == "" {
 		cfg.SetUpstreamBaseURL("https://api.commandcode.ai")
 	}
 	if *debug {
 		cfg.Debug = true
-		debugMode = true
+		debugMode.Store(true)
 	}
 
 	// 日志同时写入环形缓冲，供 WebUI 查看
@@ -158,9 +161,9 @@ Use the local client key above as the Bearer token for your OpenAI client.
 	cc := NewCCClientWithPool(pool, cfg.UpstreamBaseURL())
 	usage := loadUsage()
 
-	if primary := pool.Primary(); primary != nil {
-		FetchProviderModels(cfg.UpstreamBaseURL(), primary.APIKey)
-	} else {
+	// 模型目录不再在启动路径上同步拉取：runServer 会起后台刷新 goroutine，
+	// 上游慢或不可达时也不会推迟监听端口。
+	if pool.Primary() == nil {
 		log.Printf("[WARN] no enabled Command Code accounts; starting with an empty model catalog")
 	}
 
@@ -172,7 +175,7 @@ Use the local client key above as the Bearer token for your OpenAI client.
 	if err := runServer(cc, cfg, usage, ring); err != nil {
 		log.Fatalf("server failed: %v", err)
 	}
-	if err := usage.save(); err != nil {
+	if err := usage.Flush(); err != nil {
 		log.Printf("save usage failed: %v", err)
 	}
 }

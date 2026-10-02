@@ -44,34 +44,55 @@ func authMiddleware(cfg *Config, keys *ClientKeyPool) func(http.Handler) http.Ha
 		}
 	}
 	return func(next http.Handler) http.Handler {
+		// Brute-force protection for the local Bearer keys. The admin password
+		// always had one; without it the client-key space could be ground
+		// through /v1/chat/completions for free.
+		limiter := newIPRateLimiterWith(clientKeyFailLimit, clientKeyFailWindow, clientKeyLockoutTime)
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// /health、/usage、/webui 页面和 CORS preflight 不需要 Bearer 认证；
-			// /admin/* 有独立的管理密码认证。
+			// /health、/webui 页面和 CORS preflight 不需要 Bearer 认证；
+			// /admin/* 有独立的管理密码认证。/usage 与 /v1/* 一样需要密钥。
 			if r.Method == http.MethodOptions || isPublicPath(r.URL.Path) {
 				next.ServeHTTP(w, r)
 				return
 			}
+			ip := requestClientIP(r)
+			if ok, retryAfter := limiter.Allow(ip); !ok {
+				seconds := int(retryAfter.Seconds()) + 1
+				w.Header().Set("Retry-After", strconv.Itoa(seconds))
+				writeError(w, http.StatusTooManyRequests, "rate_limit_error",
+					fmt.Sprintf("too many failed authentications, retry in %d seconds", seconds))
+				return
+			}
 			auth := r.Header.Get("Authorization")
 			if !strings.HasPrefix(auth, "Bearer ") {
+				limiter.Fail(ip)
 				writeError(w, 401, "authentication_error", "missing Authorization header")
 				return
 			}
 			key := strings.TrimPrefix(auth, "Bearer ")
 			ck := keys.Lookup(key)
-			if ck == nil || !ck.Enabled {
+			if ck == nil || !ck.IsEnabled() {
+				limiter.Fail(ip)
 				writeError(w, 401, "authentication_error", "invalid API key")
 				return
 			}
+			limiter.Reset(ip)
 			ck.RecordUsed()
-			ctx := context.WithValue(r.Context(), ctxKeyClientKeyID, ck.ID)
+			ctx := context.WithValue(r.Context(), ctxKeyClientKeyID, ck.ID())
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
 }
 
+// isPublicPath lists the routes that skip client-key authentication.
+//
+// /usage is deliberately NOT here: its snapshot carries per-account and
+// per-client-key request and token counters, so leaving it open on an
+// internet-facing instance hands out a full usage profile of every credential.
+// It now requires the same Bearer client key as /v1/*.
 func isPublicPath(path string) bool {
 	switch path {
-	case "/health", "/usage", "/webui", "/webui/":
+	case "/health", "/webui", "/webui/":
 		return true
 	}
 	switch {
@@ -140,17 +161,34 @@ func securityHeaders() func(http.Handler) http.Handler {
 	}
 }
 
+// corsMiddleware enables browser clients for the public OpenAI-compatible API.
+//
+// Headers are attached only to /v1/* responses: the admin API, /webui, and
+// /usage are same-origin surfaces, and a wildcard ACAO there let any page on
+// the internet probe the gateway's configuration endpoints from a victim's
+// browser. Non-/v1 paths also skip the preflight short-circuit so an OPTIONS
+// request cannot be answered 204 without reaching the auth chain.
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !isCORSAllowedPath(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-		if r.Method == "OPTIONS" {
-			w.WriteHeader(204)
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// isCORSAllowedPath reports whether the path belongs to the OpenAI-compatible
+// surface that browsers are expected to call cross-origin.
+func isCORSAllowedPath(path string) bool {
+	return path == "/v1" || strings.HasPrefix(path, "/v1/")
 }
 
 func loggingMiddleware(next http.Handler) http.Handler {
@@ -182,8 +220,10 @@ func runServer(cc *CCClient, cfg *Config, usage *UsageTracker, ring *logRing) er
 	})
 	mux.HandleFunc("/v1/chat/completions", handleChatCompletions(cc, cfg, usage))
 	mux.HandleFunc("/v1/models", handleModels(cfg))
+	// /usage 与 /v1/* 同级鉴权：快照含每账号/每客户端密钥的用量明细。
 	mux.HandleFunc("/usage", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
 		json.NewEncoder(w).Encode(usage.Snapshot())
 	})
 
@@ -207,10 +247,17 @@ func runServer(cc *CCClient, cfg *Config, usage *UsageTracker, ring *logRing) er
 
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 	srv := &http.Server{
-		Addr:         addr,
-		Handler:      handler,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 600 * time.Second, // 流式响应需要长超时
+		Addr:    addr,
+		Handler: handler,
+		// ReadHeaderTimeout bounds slow-header (Slowloris) clients. A total
+		// ReadTimeout would cap the whole body read, which breaks legitimate
+		// slow uploads: the request body is capped at 50 MB (maxChatRequestBytes)
+		// by MaxBytesReader instead.
+		ReadHeaderTimeout: 10 * time.Second,
+		// WriteTimeout bounds the total response time; streaming responses renew
+		// their own deadline per chunk (see renewWriteDeadline), so a long-lived
+		// stream is not cut off at 600s.
+		WriteTimeout: 600 * time.Second,
 		IdleTimeout:  120 * time.Second,
 	}
 
@@ -221,6 +268,12 @@ func runServer(cc *CCClient, cfg *Config, usage *UsageTracker, ring *logRing) er
 	quotaCtx, stopQuotas := context.WithCancel(shutdownSignal)
 	defer stopQuotas()
 	go quotas.Run(quotaCtx)
+
+	// usage 落盘：请求路径只打脏标记，由后台每秒合并写一次。
+	go usage.RunPersistence(quotaCtx)
+
+	// 模型目录后台刷新：启动时不再阻塞监听，之后每小时对齐一次上游。
+	go runModelCatalogRefresh(quotaCtx, cc, pool, cfg)
 
 	idleConnsClosed := make(chan struct{})
 	go func() {
@@ -238,7 +291,7 @@ func runServer(cc *CCClient, cfg *Config, usage *UsageTracker, ring *logRing) er
 	log.Printf("client keys: %d configured, %d enabled", keys.Len(), keys.EnabledCount())
 	loadedModels := len(availableModels())
 	availableCount := 0
-	for _, model := range modelCatalog {
+	for _, model := range modelSnapshot() {
 		if !isModelExcluded(model.ID, cfg.Excludes()) {
 			availableCount++
 		}
